@@ -1,0 +1,10 @@
+[submodule "third_party/sdk-rust"]
+	path = third_party/sdk-rust
+	url = https://github.com/true-async/sdk-rust.git
+	branch = true-async
+	# Our fork of temporalio/sdk-rust, pinned to the `true-async` branch:
+	# v0.4.0 plus the notify-after-release fix in the c-bridge worker shutdown
+	# (drop the worker Arc clone before waking lang). Upstreamed via PR; drop
+	# the fork once it merges and bump back to a tagged temporalio release.
+	# ignore=untracked so cargo target/ output does not flag the parent dirty.
+	ignore = untracked

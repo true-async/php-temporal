@@ -1,0 +1,48 @@
+# Build artifacts
+*.o
+*.lo
+*.la
+*.dep
+.libs/
+.deps/
+modules/
+build/
+autom4te.cache/
+
+# phpize-generated files
+/config.h
+/config.h.in
+/config.h.in~
+/config.log
+/config.status
+/config.nice
+/configure
+/configure.ac
+/libtool
+/Makefile
+/Makefile.fragments
+/Makefile.global
+/Makefile.objects
+/acinclude.m4
+/aclocal.m4
+/conftest.*
+/install-sh
+/ltmain.sh
+/missing
+/mkinstalldirs
+/run-tests.php
+/tests/**/*.diff
+/tests/**/*.out
+/tests/**/*.exp
+/tests/**/*.log
+/tests/**/*.php
+!/tests/**/*.phpt
+
+# Generated arginfo is checked in (PECL convention); keep it.
+
+# Editor / tooling
+*.swp
+*~
+.idea/
+.vscode/
+.serena/

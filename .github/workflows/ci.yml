@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  PHP_PREFIX: /opt/trueasync-php
+
+jobs:
+  test:
+    name: extension + SDK integration (live dev server)
+    runs-on: ubuntu-24.04   # libuv >= 1.45 needed by TrueAsync
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # ---- TrueAsync PHP (built from the php-src fork, cached by its SHA) ----
+
+      - name: Resolve TrueAsync php-src + php-async revisions
+        id: phpsrc
+        run: |
+          echo "sha=$(git ls-remote https://github.com/true-async/php-src refs/heads/true-async | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "asha=$(git ls-remote https://github.com/true-async/php-async refs/heads/main | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache TrueAsync PHP
+        id: php-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PHP_PREFIX }}
+          key: trueasync-php-v3-${{ runner.os }}-${{ steps.phpsrc.outputs.sha }}-${{ steps.phpsrc.outputs.asha }}
+
+      - name: Build TrueAsync PHP
+        if: steps.php-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison re2c libuv1-dev libssl-dev zlib1g-dev libonig-dev
+          git clone --depth 1 --branch true-async https://github.com/true-async/php-src /tmp/php-src
+          # ext/async lives in its own repo, nested into the php-src tree;
+          # without it buildconf does not even know --enable-async.
+          git clone --depth 1 https://github.com/true-async/php-async /tmp/php-src/ext/async
+          cd /tmp/php-src
+          ./buildconf
+          # --disable-all must come FIRST: later flags win, so every enable
+          # (including --enable-async) has to follow it.
+          ./configure --prefix="$PHP_PREFIX" \
+            --disable-all --disable-cgi --disable-phpdbg \
+            --enable-zts --enable-async \
+            --enable-sockets --enable-pcntl --enable-posix \
+            --enable-mbstring --enable-ctype --enable-filter \
+            --enable-tokenizer --enable-phar \
+            --with-openssl --with-zlib
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Use TrueAsync PHP
+        run: |
+          # libuv1: TrueAsync runtime dep; protobuf-compiler: prost-wkt-types
+          # build script in the core c-bridge needs protoc.
+          sudo apt-get update && sudo apt-get install -y libuv1 protobuf-compiler
+          echo "$PHP_PREFIX/bin" >> "$GITHUB_PATH"
+          "$PHP_PREFIX/bin/php" -v
+          # Fail fast if the TrueAsync runtime is missing (a silent configure
+          # miss otherwise surfaces as cryptic test failures much later).
+          "$PHP_PREFIX/bin/php" -r 'exit(function_exists("Async\\await") ? 0 : 1);' \
+            || { echo "TrueAsync runtime (ext/async) is not in this PHP build" >&2; exit 1; }
+
+      # ---- The Rust core c-bridge (cargo target dir cached) ----
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: third_party/sdk-rust
+
+      - name: Build the Temporal core c-bridge
+        run: cargo build --release -p temporalio-sdk-core-c-bridge --manifest-path third_party/sdk-rust/Cargo.toml
+
+      # ---- The extension ----
+
+      - name: Build the extension
+        run: |
+          phpize
+          ./configure --enable-temporal --with-php-config="$PHP_PREFIX/bin/php-config"
+          make -j"$(nproc)"
+
+      # ---- Live Temporal dev server ----
+
+      - name: Start the Temporal dev server
+        run: |
+          docker run -d --name temporal-dev -p 7233:7233 \
+            temporalio/temporal server start-dev --ip 0.0.0.0 --log-level error
+          for i in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/127.0.0.1/7233) 2>/dev/null; then exit 0; fi
+            sleep 1
+          done
+          echo "Temporal dev server did not come up" >&2
+          docker logs temporal-dev >&2 || true
+          exit 1
+
+      # ---- Extension test suite (offline + live) ----
+
+      - name: Extension tests
+        run: php run-tests.php -q -p "$(command -v php)" -d extension="$(pwd)/modules/temporal.so" --show-diff tests/
+
+      # ---- SDK fork integration tests over this extension ----
+
+      - name: Check out the SDK fork
+        uses: actions/checkout@v4
+        with:
+          repository: true-async/sdk-php
+          ref: true-async
+          path: sdk-php
+
+      - name: Install SDK dependencies
+        working-directory: sdk-php
+        run: |
+          composer config -g github-oauth.github.com "${{ secrets.GITHUB_TOKEN }}"
+          # composer.lock is gitignored upstream (library policy), so this is a
+          # full resolution and it validates require-dev platform needs too:
+          # phpunit/psalm want dom/simplexml, laminas caps php <= released
+          # versions while ours is 8.6.0-dev. --no-dev skips installing them;
+          # --ignore-platform-reqs silences their platform pins during
+          # resolution. The runtime deps are pure PHP + ext-json.
+          composer update --no-interaction --no-progress --no-dev --ignore-platform-reqs
+
+      - name: SDK integration tests
+        working-directory: sdk-php
+        run: |
+          status=0
+          for t in tests/truasync/*.php; do
+            echo "::group::$t"
+            if ! php -d extension="$GITHUB_WORKSPACE/modules/temporal.so" "$t"; then
+              echo "FAILED: $t"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
