@@ -24,51 +24,29 @@ The **high-level client API is the reused official Temporal PHP SDK** (the
 this transport — see the [`true-async/sdk-php`](https://github.com/true-async/sdk-php)
 fork (branch `true-async`), which strips gRPC/RoadRunner from the dependencies.
 
-A **client** starting a workflow over the transport:
+A client starting a workflow — **written flat**: the first Core call launches the
+TrueAsync scheduler and the script runs as the main coroutine, so no explicit
+`Async\spawn()` wrapper is needed (the same way `Async\await()` does it).
 
 ```php
 use Temporal\Client\WorkflowClient;
 use Temporal\Client\WorkflowOptions;
 use Temporal\Client\GRPC\TrueAsyncServiceClient;
 use TrueAsync\Temporal\Core\Connection;
-use function Async\spawn;
-use function Async\await;
 
-$run = await(spawn(function () {
-    // Native transport over the Rust core; parks the coroutine on every RPC.
-    $core   = new Connection('127.0.0.1:7233');
-    $client = WorkflowClient::create(TrueAsyncServiceClient::fromCore($core));
+$client = WorkflowClient::create(
+    TrueAsyncServiceClient::fromCore(new Connection('127.0.0.1:7233')),
+);
 
-    $stub = $client->newUntypedWorkflowStub('OrderWorkflow',
-        (new WorkflowOptions())->withTaskQueue('orders'));
+$stub = $client->newUntypedWorkflowStub('OrderWorkflow',
+    (new WorkflowOptions())->withTaskQueue('orders')->withWorkflowId('order-42'));
 
-    return $client->start($stub, $order);
-}));
+$run = $client->start($stub, $orderId);
+echo $run->getResult();   // parks the coroutine until the workflow completes
 ```
 
-And a **worker** serving that task queue — workflows and activities polled
-concurrently on the one reactor:
-
-```php
-use TrueAsync\Temporal\Core\Connection;
-use TrueAsync\Temporal\Core\Worker as CoreWorker;
-use Temporal\Worker\TrueAsync\TemporalWorker;
-use function Async\spawn;
-use function Async\await;
-
-await(spawn(function () {
-    $connection = new Connection('127.0.0.1:7233');
-    $core       = new CoreWorker($connection, 'orders');   // task queue
-
-    $worker = new TemporalWorker($core, 'orders');
-    $worker->registerWorkflowTypes(OrderWorkflow::class);
-    $worker->registerActivityImplementations(new OrderActivities());
-
-    // Long-polls workflow activations and activity tasks until shutdown;
-    // call $worker->shutdown() from another coroutine or a signal handler.
-    $worker->run();
-}));
-```
+More — defining workflows/activities, running a worker, signals and queries — in
+[Usage](#usage) below.
 
 ## What this extension provides
 
@@ -83,6 +61,112 @@ Just the transport seam:
 
 Everything user-facing (workflow client, options, data converter, the generated
 `Temporal\Api\*` protobuf messages) comes from the reused SDK.
+
+## Usage
+
+Workflow and activity code is the **reused SDK's** — the same attributes and
+generator (`yield`) style as `temporalio/sdk-php`; only the transport differs.
+
+### Define a workflow and an activity
+
+```php
+use Temporal\Activity\ActivityInterface;
+use Temporal\Activity\ActivityMethod;
+use Temporal\Activity\ActivityOptions;
+use Temporal\Workflow;
+use Temporal\Workflow\WorkflowInterface;
+use Temporal\Workflow\WorkflowMethod;
+
+#[WorkflowInterface]
+class OrderWorkflow
+{
+    #[WorkflowMethod(name: 'OrderWorkflow')]
+    public function run(string $orderId): \Generator
+    {
+        $activities = Workflow::newActivityStub(
+            OrderActivities::class,
+            ActivityOptions::new()->withStartToCloseTimeout(10),
+        );
+
+        $charged = yield $activities->charge($orderId);   // schedule + await the activity
+
+        return "order {$orderId}: {$charged}";
+    }
+}
+
+#[ActivityInterface(prefix: 'Order.')]
+class OrderActivities
+{
+    #[ActivityMethod]
+    public function charge(string $orderId): string
+    {
+        // real I/O is fine here — activities run in ordinary TrueAsync coroutines
+        return 'charged';
+    }
+}
+```
+
+### Run a worker
+
+```php
+use Temporal\Worker\TrueAsync\TemporalWorker;
+use TrueAsync\Temporal\Core\Connection;
+use TrueAsync\Temporal\Core\Worker as CoreWorker;
+
+$core = new CoreWorker(new Connection('127.0.0.1:7233'), 'orders');  // 'orders' = task queue
+
+(new TemporalWorker($core, 'orders'))
+    ->registerWorkflowTypes(OrderWorkflow::class)
+    ->registerActivityImplementations(new OrderActivities())
+    ->run();   // long-polls workflows + activities until shutdown()
+```
+
+`run()` blocks until the core shuts down; call `$worker->shutdown()` from a signal
+handler or another coroutine to stop the loops, after which `run()` finalizes and
+returns.
+
+### Signal and query a running workflow
+
+Signal and query handlers are plain methods on the workflow:
+
+```php
+#[WorkflowInterface]
+class SubscriptionWorkflow
+{
+    private bool $cancelled = false;
+
+    #[WorkflowMethod(name: 'SubscriptionWorkflow')]
+    public function run(): \Generator
+    {
+        yield Workflow::await(fn() => $this->cancelled);
+        return 'cancelled';
+    }
+
+    #[Workflow\SignalMethod(name: 'cancel')]
+    public function cancel(): void
+    {
+        $this->cancelled = true;
+    }
+
+    #[Workflow\QueryMethod(name: 'isCancelled')]
+    public function isCancelled(): bool
+    {
+        return $this->cancelled;
+    }
+}
+```
+
+Drive it from a client through the stub:
+
+```php
+$stub = $client->newUntypedWorkflowStub('SubscriptionWorkflow',
+    (new WorkflowOptions())->withTaskQueue('orders')->withWorkflowId('sub-1'));
+$run = $client->start($stub);
+
+$open = (bool) $stub->query('isCancelled')->getValue(0);   // false — read state, no side effects
+$stub->signal('cancel');                                    // deliver a signal
+echo $run->getResult();                                     // "cancelled"
+```
 
 ## Status
 
