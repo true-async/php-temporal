@@ -45,12 +45,12 @@ typedef struct {
 	int      refcount;
 	void    *box;
 	void   (*free_box)(void *);
-} tphp_handle_t;
+} temporal_php_handle_t;
 
 /* Returns NULL on allocation failure; the caller throws and frees the box. */
-static tphp_handle_t *tphp_handle_new(void *box, void (*free_box)(void *))
+static temporal_php_handle_t *temporal_php_handle_new(void *box, void (*free_box)(void *))
 {
-	tphp_handle_t *h = (tphp_handle_t *) calloc(1, sizeof(*h));
+	temporal_php_handle_t *h = (temporal_php_handle_t *) calloc(1, sizeof(*h));
 	if (h == NULL) {
 		return NULL;
 	}
@@ -61,14 +61,14 @@ static tphp_handle_t *tphp_handle_new(void *box, void (*free_box)(void *))
 	return h;
 }
 
-static void tphp_handle_addref(tphp_handle_t *h)
+static void temporal_php_handle_addref(temporal_php_handle_t *h)
 {
 	tsrm_mutex_lock(h->mutex);
 	h->refcount++;
 	tsrm_mutex_unlock(h->mutex);
 }
 
-static void tphp_handle_release(tphp_handle_t *h)
+static void temporal_php_handle_release(temporal_php_handle_t *h)
 {
 	tsrm_mutex_lock(h->mutex);
 	bool last = (--h->refcount == 0);
@@ -104,7 +104,7 @@ static void temporal_connection_free_object(zend_object *object)
 	temporal_connection_obj *obj = temporal_connection_from_obj(object);
 
 	if (obj->connection != NULL) {
-		tphp_handle_release((tphp_handle_t *) obj->connection);
+		temporal_php_handle_release((temporal_php_handle_t *) obj->connection);
 		obj->connection = NULL;
 	}
 
@@ -132,7 +132,7 @@ static void temporal_worker_free_object(zend_object *object)
 	temporal_worker_obj *obj = temporal_worker_from_obj(object);
 
 	if (obj->worker != NULL) {
-		tphp_handle_release((tphp_handle_t *) obj->worker);
+		temporal_php_handle_release((temporal_php_handle_t *) obj->worker);
 		obj->worker = NULL;
 	}
 	if (obj->connection != NULL) {
@@ -167,7 +167,7 @@ void temporal_register_objects(void)
  * struct AND handed back to the caller without duplicating the field list.
  * Only the relevant fields are set: `connection` for connect; `data`/`owner`
  * for an rpc reply; `fail`/`status` on failure. `data` is borrowed from the
- * core-owned `owner` (released with tphp_response_free); `fail` is heap. */
+ * core-owned `owner` (released with temporal_php_response_free); `fail` is heap. */
 typedef struct {
 	void          *connection;
 	const uint8_t *data;
@@ -192,7 +192,7 @@ typedef struct {
 	int      refcount;
 	bool     completed;
 	zend_async_trigger_event_t *trigger;   /* NULL once the reactor tears down */
-	tphp_handle_t *handle;                 /* core handle kept alive for this op (NULL for connect) */
+	temporal_php_handle_t *handle;                 /* core handle kept alive for this op (NULL for connect) */
 	void *cancel_token;                    /* reactor-owned RPC cancel token (NULL otherwise) */
 	temporal_result_t result;
 } temporal_call_t;
@@ -200,7 +200,7 @@ typedef struct {
 static void temporal_call_free(temporal_call_t *call)
 {
 	if (call->handle != NULL) {
-		tphp_handle_release(call->handle);
+		temporal_php_handle_release(call->handle);
 	}
 	tsrm_mutex_free(call->mutex);
 	free(call);
@@ -210,10 +210,10 @@ static void temporal_call_free(temporal_call_t *call)
 static void temporal_result_drop(const temporal_result_t *r)
 {
 	if (r->connection != NULL) {
-		tphp_connection_free(r->connection);
+		temporal_php_connection_free(r->connection);
 	}
 	if (r->owner != NULL) {
-		tphp_response_free(r->owner);
+		temporal_php_response_free(r->owner);
 	}
 	free(r->fail);
 	free(r->details);
@@ -335,16 +335,16 @@ static void temporal_call_collect(temporal_call_t *call, zend_coroutine_t *co,
 		 * returns promptly, drops the in-flight ref and frees the handle now
 		 * instead of lingering until the call completes on its own. */
 		if (!completed && cancel_token != NULL) {
-			tphp_cancel_token_cancel(cancel_token);
+			temporal_php_cancel_token_cancel(cancel_token);
 		}
 		temporal_result_drop(&r);
 		if (last) temporal_call_free(call);
-		tphp_cancel_token_free(cancel_token);
+		temporal_php_cancel_token_free(cancel_token);
 		return;
 	}
 
 	if (last) temporal_call_free(call);
-	tphp_cancel_token_free(cancel_token);
+	temporal_php_cancel_token_free(cancel_token);
 
 	if (completed) {
 		out->r = r;                              /* ownership passes to the caller */
@@ -352,7 +352,7 @@ static void temporal_call_collect(temporal_call_t *call, zend_coroutine_t *co,
 }
 
 /* Park the current coroutine on a connect; fills `out`. */
-static void temporal_run_connect(const tphp_connect_params_t *params, temporal_outcome_t *out)
+static void temporal_run_connect(const temporal_php_connect_params_t *params, temporal_outcome_t *out)
 {
 	zend_coroutine_t *co = ZEND_ASYNC_CURRENT_COROUTINE;
 
@@ -368,12 +368,12 @@ static void temporal_run_connect(const tphp_connect_params_t *params, temporal_o
 	                       zend_async_waker_callback_resolve, NULL);
 	call->trigger->base.start(&call->trigger->base);   /* keep the loop alive */
 
-	tphp_connect(temporal_runtime_handle, params, call, temporal_connect_done);
+	temporal_php_connect(temporal_runtime_handle, params, call, temporal_connect_done);
 	temporal_call_collect(call, co, out);
 }
 
 /* Park the current coroutine on a unary RPC; fills `out`. */
-static void temporal_run_rpc(tphp_handle_t *handle, int service, const char *method,
+static void temporal_run_rpc(temporal_php_handle_t *handle, int service, const char *method,
                              const uint8_t *req, size_t req_len, uint32_t timeout_ms,
                              const char *const *metadata, size_t metadata_count,
                              temporal_outcome_t *out)
@@ -389,17 +389,17 @@ static void temporal_run_rpc(tphp_handle_t *handle, int service, const char *met
 
 	/* Keep the handle alive until this op's callback fires, even past a cancel. */
 	call->handle = handle;
-	tphp_handle_addref(handle);
+	temporal_php_handle_addref(handle);
 
 	/* A cancel token so a cancelled coroutine aborts the RPC promptly. */
-	call->cancel_token = tphp_cancel_token_new();
+	call->cancel_token = temporal_php_cancel_token_new();
 
 	ZEND_ASYNC_WAKER_NEW(co);
 	zend_async_resume_when(co, &call->trigger->base, false,
 	                       zend_async_waker_callback_resolve, NULL);
 	call->trigger->base.start(&call->trigger->base);
 
-	tphp_rpc_call(temporal_runtime_handle, handle->box, service, method, req, req_len,
+	temporal_php_rpc_call(temporal_runtime_handle, handle->box, service, method, req, req_len,
 	              timeout_ms, metadata, metadata_count, call->cancel_token, call, temporal_rpc_done);
 	temporal_call_collect(call, co, out);
 }
@@ -533,8 +533,8 @@ static void temporal_worker_op_done(void *user_data, char *fail, size_t fail_len
 
 /* Park the current coroutine on a worker poll (activity or workflow, per the
  * given bridge poll function); fills `out`. */
-static void temporal_run_worker_poll(tphp_handle_t *handle,
-                                     void (*poll)(void *, void *, tphp_worker_poll_cb),
+static void temporal_run_worker_poll(temporal_php_handle_t *handle,
+                                     void (*poll)(void *, void *, temporal_php_worker_poll_cb),
                                      temporal_outcome_t *out)
 {
 	zend_coroutine_t *co = ZEND_ASYNC_CURRENT_COROUTINE;
@@ -547,7 +547,7 @@ static void temporal_run_worker_poll(tphp_handle_t *handle,
 	}
 
 	call->handle = handle;
-	tphp_handle_addref(handle);
+	temporal_php_handle_addref(handle);
 
 	ZEND_ASYNC_WAKER_NEW(co);
 	zend_async_resume_when(co, &call->trigger->base, false,
@@ -560,9 +560,9 @@ static void temporal_run_worker_poll(tphp_handle_t *handle,
 
 /* Park the current coroutine on a worker completion (activity or workflow, per
  * the given bridge complete function); fills `out`. */
-static void temporal_run_worker_complete(tphp_handle_t *handle,
+static void temporal_run_worker_complete(temporal_php_handle_t *handle,
                                          void (*complete)(void *, const uint8_t *, size_t,
-                                                          void *, tphp_worker_done_cb),
+                                                          void *, temporal_php_worker_done_cb),
                                          const uint8_t *completion, size_t len,
                                          temporal_outcome_t *out)
 {
@@ -576,7 +576,7 @@ static void temporal_run_worker_complete(tphp_handle_t *handle,
 	}
 
 	call->handle = handle;
-	tphp_handle_addref(handle);
+	temporal_php_handle_addref(handle);
 
 	ZEND_ASYNC_WAKER_NEW(co);
 	zend_async_resume_when(co, &call->trigger->base, false,
@@ -588,7 +588,7 @@ static void temporal_run_worker_complete(tphp_handle_t *handle,
 }
 
 /* Park the current coroutine on shutdown finalization; fills `out`. */
-static void temporal_run_worker_finalize(tphp_handle_t *handle, temporal_outcome_t *out)
+static void temporal_run_worker_finalize(temporal_php_handle_t *handle, temporal_outcome_t *out)
 {
 	zend_coroutine_t *co = ZEND_ASYNC_CURRENT_COROUTINE;
 
@@ -600,14 +600,14 @@ static void temporal_run_worker_finalize(tphp_handle_t *handle, temporal_outcome
 	}
 
 	call->handle = handle;
-	tphp_handle_addref(handle);
+	temporal_php_handle_addref(handle);
 
 	ZEND_ASYNC_WAKER_NEW(co);
 	zend_async_resume_when(co, &call->trigger->base, false,
 	                       zend_async_waker_callback_resolve, NULL);
 	call->trigger->base.start(&call->trigger->base);
 
-	tphp_worker_finalize_shutdown(handle->box, call, temporal_worker_op_done);
+	temporal_php_worker_finalize_shutdown(handle->box, call, temporal_worker_op_done);
 	temporal_call_collect(call, co, out);
 }
 
@@ -664,7 +664,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Connection, __construct)
 		identity_val = identity_buf;
 	}
 
-	tphp_connect_params_t params;
+	temporal_php_connect_params_t params;
 	memset(&params, 0, sizeof(params));
 	params.target_url     = target_url;
 	params.client_name    = "temporal-php";
@@ -698,9 +698,9 @@ PHP_METHOD(TrueAsync_Temporal_Core_Connection, __construct)
 	}
 
 	temporal_connection_obj *self = temporal_connection_from_obj(Z_OBJ_P(ZEND_THIS));
-	self->connection = tphp_handle_new(out.r.connection, tphp_connection_free);
+	self->connection = temporal_php_handle_new(out.r.connection, temporal_php_connection_free);
 	if (self->connection == NULL) {
-		tphp_connection_free(out.r.connection);
+		temporal_php_connection_free(out.r.connection);
 		zend_throw_error(NULL, "temporal: out of memory");
 		RETURN_THROWS();
 	}
@@ -749,7 +749,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Connection, rpcCall)
 	}
 
 	temporal_outcome_t out;
-	temporal_run_rpc((tphp_handle_t *) self->connection, (int) service, ZSTR_VAL(method),
+	temporal_run_rpc((temporal_php_handle_t *) self->connection, (int) service, ZSTR_VAL(method),
 	                 (const uint8_t *) ZSTR_VAL(request), ZSTR_LEN(request),
 	                 (uint32_t) timeout_ms, meta_ptrs, meta_count, &out);
 
@@ -795,7 +795,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Connection, rpcCall)
 	}
 
 	RETVAL_STRINGL((const char *) out.r.data, out.r.data_len);
-	tphp_response_free(out.r.owner);
+	temporal_php_response_free(out.r.owner);
 	free(out.r.fail);
 	free(out.r.details);   /* normally NULL on success */
 }
@@ -853,7 +853,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, __construct)
 		RETURN_THROWS();
 	}
 
-	tphp_worker_options_t opts = {
+	temporal_php_worker_options_t opts = {
 		.activity_slots = (uint32_t) max_activities,
 		.workflow_slots = 100,
 		.local_activity_slots = 100,
@@ -899,7 +899,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, __construct)
 	}
 
 	char *err = NULL;
-	void *worker = tphp_worker_new(((tphp_handle_t *) conn->connection)->box,
+	void *worker = temporal_php_worker_new(((temporal_php_handle_t *) conn->connection)->box,
 	                               namespace != NULL ? ZSTR_VAL(namespace) : "default",
 	                               ZSTR_VAL(task_queue), &opts, &err);
 
@@ -911,9 +911,9 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, __construct)
 	}
 
 	temporal_worker_obj *self = temporal_worker_from_obj(Z_OBJ_P(ZEND_THIS));
-	self->worker = tphp_handle_new(worker, tphp_worker_free);
+	self->worker = temporal_php_handle_new(worker, temporal_php_worker_free);
 	if (self->worker == NULL) {
-		tphp_worker_free(worker);
+		temporal_php_worker_free(worker);
 		zend_throw_error(NULL, "temporal: out of memory");
 		RETURN_THROWS();
 	}
@@ -933,7 +933,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, pollActivityTask)
 	}
 
 	temporal_outcome_t out;
-	temporal_run_worker_poll((tphp_handle_t *) self->worker, tphp_worker_poll_activity, &out);
+	temporal_run_worker_poll((temporal_php_handle_t *) self->worker, temporal_php_worker_poll_activity, &out);
 
 	if (out.cancelled) {
 		RETURN_THROWS();
@@ -950,7 +950,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, pollActivityTask)
 	}
 
 	RETVAL_STRINGL((const char *) out.r.data, out.r.data_len);
-	tphp_response_free(out.r.owner);
+	temporal_php_response_free(out.r.owner);
 }
 
 PHP_METHOD(TrueAsync_Temporal_Core_Worker, pollWorkflowActivation)
@@ -965,7 +965,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, pollWorkflowActivation)
 	}
 
 	temporal_outcome_t out;
-	temporal_run_worker_poll((tphp_handle_t *) self->worker, tphp_worker_poll_workflow, &out);
+	temporal_run_worker_poll((temporal_php_handle_t *) self->worker, temporal_php_worker_poll_workflow, &out);
 
 	if (out.cancelled) {
 		RETURN_THROWS();
@@ -982,7 +982,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, pollWorkflowActivation)
 	}
 
 	RETVAL_STRINGL((const char *) out.r.data, out.r.data_len);
-	tphp_response_free(out.r.owner);
+	temporal_php_response_free(out.r.owner);
 }
 
 PHP_METHOD(TrueAsync_Temporal_Core_Worker, completeActivityTask)
@@ -1001,7 +1001,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, completeActivityTask)
 	}
 
 	temporal_outcome_t out;
-	temporal_run_worker_complete((tphp_handle_t *) self->worker, tphp_worker_complete_activity,
+	temporal_run_worker_complete((temporal_php_handle_t *) self->worker, temporal_php_worker_complete_activity,
 	                             (const uint8_t *) ZSTR_VAL(completion), ZSTR_LEN(completion), &out);
 
 	if (out.cancelled) {
@@ -1031,7 +1031,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, completeWorkflowActivation)
 	}
 
 	temporal_outcome_t out;
-	temporal_run_worker_complete((tphp_handle_t *) self->worker, tphp_worker_complete_workflow,
+	temporal_run_worker_complete((temporal_php_handle_t *) self->worker, temporal_php_worker_complete_workflow,
 	                             (const uint8_t *) ZSTR_VAL(completion), ZSTR_LEN(completion), &out);
 
 	if (out.cancelled) {
@@ -1062,7 +1062,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, recordActivityHeartbeat)
 		RETURN_THROWS();
 	}
 
-	char *fail = tphp_worker_record_heartbeat(((tphp_handle_t *) self->worker)->box,
+	char *fail = temporal_php_worker_record_heartbeat(((temporal_php_handle_t *) self->worker)->box,
 	                                          (const uint8_t *) ZSTR_VAL(heartbeat),
 	                                          ZSTR_LEN(heartbeat));
 
@@ -1080,7 +1080,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, initiateShutdown)
 	temporal_worker_obj *self = temporal_worker_from_obj(Z_OBJ_P(ZEND_THIS));
 
 	if (self->worker != NULL && !self->finalized) {
-		tphp_worker_initiate_shutdown(((tphp_handle_t *) self->worker)->box);
+		temporal_php_worker_initiate_shutdown(((temporal_php_handle_t *) self->worker)->box);
 	}
 }
 
@@ -1099,7 +1099,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, finalizeShutdown)
 	 * poll/complete task's worker clone before waking us (notify-after-release),
 	 * so finalize's Arc::try_unwrap deterministically sees sole ownership. */
 	temporal_outcome_t out;
-	temporal_run_worker_finalize((tphp_handle_t *) self->worker, &out);
+	temporal_run_worker_finalize((temporal_php_handle_t *) self->worker, &out);
 
 	/* The spawned core task takes its inner worker unconditionally (before the
 	 * try_unwrap branch and regardless of our cancellation), so the worker is

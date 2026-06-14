@@ -48,7 +48,7 @@ PHP_MINIT_FUNCTION(temporal)
 
 	/* Create the process-wide core runtime. */
 	char *err = NULL;
-	temporal_runtime_handle = tphp_runtime_new(&err);
+	temporal_runtime_handle = temporal_php_runtime_new(&err);
 	if (temporal_runtime_handle == NULL) {
 		zend_error(E_WARNING, "temporal: failed to create core runtime: %s",
 		           err != NULL ? err : "unknown error");
@@ -62,7 +62,7 @@ PHP_MINIT_FUNCTION(temporal)
 PHP_MSHUTDOWN_FUNCTION(temporal)
 {
 	if (temporal_runtime_handle != NULL) {
-		tphp_runtime_free(temporal_runtime_handle);
+		temporal_php_runtime_free(temporal_runtime_handle);
 		temporal_runtime_handle = NULL;
 	}
 

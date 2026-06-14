@@ -16,7 +16,7 @@
 #include "temporal_core.h"
 
 /* Build a ByteArrayRef over a C string (empty/unset when s is NULL). */
-static inline TemporalCoreByteArrayRef tphp_ref(const char *s)
+static inline TemporalCoreByteArrayRef temporal_php_ref(const char *s)
 {
 	TemporalCoreByteArrayRef r;
 	r.data = (const uint8_t *) (s != NULL ? s : "");
@@ -24,18 +24,34 @@ static inline TemporalCoreByteArrayRef tphp_ref(const char *s)
 	return r;
 }
 
-static inline char *tphp_strdup(const char *s)
+static inline char *temporal_php_strdup(const char *s)
 {
 	return (s != NULL) ? strdup(s) : NULL;
 }
 
+/* Copy a core error ByteArray into a heap C string, or duplicate `fallback`
+ * when the core gave no message. Does not free the source buffer. */
+static char *temporal_php_dup_fail(const TemporalCoreByteArray *fail, const char *fallback)
+{
+	if (fail == NULL) {
+		return temporal_php_strdup(fallback);
+	}
+
+	char *out = (char *) malloc(fail->size + 1);
+	if (out != NULL) {
+		memcpy(out, fail->data, fail->size);
+		out[fail->size] = '\0';
+	}
+	return out;
+}
+
 /* --- Runtime ----------------------------------------------------------- */
 
-/* Process-wide runtime, cached so tphp_response_free can release core buffers
+/* Process-wide runtime, cached so temporal_php_response_free can release core buffers
  * without threading the runtime back through every layer. Set in MINIT. */
-static void *tphp_g_runtime = NULL;
+static void *temporal_php_g_runtime = NULL;
 
-void *tphp_runtime_new(char **err_out)
+void *temporal_php_runtime_new(char **err_out)
 {
 	TemporalCoreRuntimeOptions options;
 	memset(&options, 0, sizeof(options));
@@ -44,35 +60,26 @@ void *tphp_runtime_new(char **err_out)
 
 	if (result.runtime == NULL) {
 		if (err_out != NULL) {
-			if (result.fail != NULL) {
-				*err_out = (char *) malloc(result.fail->size + 1);
-				if (*err_out != NULL) {
-					memcpy(*err_out, result.fail->data, result.fail->size);
-					(*err_out)[result.fail->size] = '\0';
-				}
-			} else {
-				*err_out = tphp_strdup("failed to create Temporal core runtime");
-			}
+			*err_out = temporal_php_dup_fail(result.fail, "failed to create Temporal core runtime");
 		}
-
 		/* The fail buffer cannot be freed through a runtime that failed to
 		 * create; with default options this path is effectively unreachable. */
 		return NULL;
 	}
 
-	tphp_g_runtime = result.runtime;
+	temporal_php_g_runtime = result.runtime;
 	return result.runtime;
 }
 
-void tphp_response_free(void *response_owner)
+void temporal_php_response_free(void *response_owner)
 {
 	if (response_owner != NULL) {
-		temporal_core_byte_array_free((TemporalCoreRuntime *) tphp_g_runtime,
+		temporal_core_byte_array_free((TemporalCoreRuntime *) temporal_php_g_runtime,
 		                              (const TemporalCoreByteArray *) response_owner);
 	}
 }
 
-void tphp_runtime_free(void *runtime)
+void temporal_php_runtime_free(void *runtime)
 {
 	if (runtime != NULL) {
 		temporal_core_runtime_free((TemporalCoreRuntime *) runtime);
@@ -87,7 +94,7 @@ void tphp_runtime_free(void *runtime)
  * requires options to live through the callback). */
 typedef struct {
 	void                 *user_data;
-	tphp_connect_done_cb  done;
+	temporal_php_connect_done_cb  done;
 	void                 *runtime;
 
 	char *target_url;
@@ -102,9 +109,9 @@ typedef struct {
 
 	TemporalCoreClientTlsOptions    tls;
 	TemporalCoreConnectionOptions   options;
-} tphp_connect_ctx;
+} temporal_php_connect_ctx;
 
-static void tphp_connect_ctx_free(tphp_connect_ctx *c)
+static void temporal_php_connect_ctx_free(temporal_php_connect_ctx *c)
 {
 	free(c->target_url);
 	free(c->client_name);
@@ -118,10 +125,10 @@ static void tphp_connect_ctx_free(tphp_connect_ctx *c)
 	free(c);
 }
 
-static void tphp_on_connect(void *user_data, TemporalCoreConnection *success,
+static void temporal_php_on_connect(void *user_data, TemporalCoreConnection *success,
                             const TemporalCoreByteArray *fail)
 {
-	tphp_connect_ctx *c = (tphp_connect_ctx *) user_data;
+	temporal_php_connect_ctx *c = (temporal_php_connect_ctx *) user_data;
 	char *fail_msg = NULL;
 
 	if (success == NULL && fail != NULL) {
@@ -137,13 +144,13 @@ static void tphp_on_connect(void *user_data, TemporalCoreConnection *success,
 	}
 
 	c->done(c->user_data, (void *) success, fail_msg);
-	tphp_connect_ctx_free(c);
+	temporal_php_connect_ctx_free(c);
 }
 
-void tphp_connect(void *runtime, const tphp_connect_params_t *params,
-                  void *user_data, tphp_connect_done_cb done)
+void temporal_php_connect(void *runtime, const temporal_php_connect_params_t *params,
+                  void *user_data, temporal_php_connect_done_cb done)
 {
-	tphp_connect_ctx *c = (tphp_connect_ctx *) calloc(1, sizeof(*c));
+	temporal_php_connect_ctx *c = (temporal_php_connect_ctx *) calloc(1, sizeof(*c));
 	if (c == NULL) {
 		done(user_data, NULL, strdup("temporal: out of memory"));
 		return;
@@ -153,37 +160,37 @@ void tphp_connect(void *runtime, const tphp_connect_params_t *params,
 	c->done = done;
 	c->runtime = runtime;
 
-	c->target_url      = tphp_strdup(params->target_url);
-	c->client_name     = tphp_strdup(params->client_name);
-	c->client_version  = tphp_strdup(params->client_version);
-	c->identity        = tphp_strdup(params->identity);
-	c->api_key         = tphp_strdup(params->api_key);
-	c->tls_root_ca     = tphp_strdup(params->tls_server_root_ca_cert);
-	c->tls_client_cert = tphp_strdup(params->tls_client_cert);
-	c->tls_client_key  = tphp_strdup(params->tls_client_private_key);
-	c->tls_server_name = tphp_strdup(params->tls_server_name);
+	c->target_url      = temporal_php_strdup(params->target_url);
+	c->client_name     = temporal_php_strdup(params->client_name);
+	c->client_version  = temporal_php_strdup(params->client_version);
+	c->identity        = temporal_php_strdup(params->identity);
+	c->api_key         = temporal_php_strdup(params->api_key);
+	c->tls_root_ca     = temporal_php_strdup(params->tls_server_root_ca_cert);
+	c->tls_client_cert = temporal_php_strdup(params->tls_client_cert);
+	c->tls_client_key  = temporal_php_strdup(params->tls_client_private_key);
+	c->tls_server_name = temporal_php_strdup(params->tls_server_name);
 
 	memset(&c->options, 0, sizeof(c->options));
-	c->options.target_url     = tphp_ref(c->target_url);
-	c->options.client_name    = tphp_ref(c->client_name);
-	c->options.client_version = tphp_ref(c->client_version);
-	c->options.identity       = tphp_ref(c->identity);
-	c->options.api_key        = tphp_ref(c->api_key);
+	c->options.target_url     = temporal_php_ref(c->target_url);
+	c->options.client_name    = temporal_php_ref(c->client_name);
+	c->options.client_version = temporal_php_ref(c->client_version);
+	c->options.identity       = temporal_php_ref(c->identity);
+	c->options.api_key        = temporal_php_ref(c->api_key);
 
 	if (params->tls_enabled) {
 		memset(&c->tls, 0, sizeof(c->tls));
-		c->tls.server_root_ca_cert = tphp_ref(c->tls_root_ca);
-		c->tls.client_cert         = tphp_ref(c->tls_client_cert);
-		c->tls.client_private_key  = tphp_ref(c->tls_client_key);
-		c->tls.domain              = tphp_ref(c->tls_server_name);
+		c->tls.server_root_ca_cert = temporal_php_ref(c->tls_root_ca);
+		c->tls.client_cert         = temporal_php_ref(c->tls_client_cert);
+		c->tls.client_private_key  = temporal_php_ref(c->tls_client_key);
+		c->tls.domain              = temporal_php_ref(c->tls_server_name);
 		c->options.tls_options = &c->tls;
 	}
 
 	temporal_core_client_connect((TemporalCoreRuntime *) runtime, &c->options, c,
-	                             tphp_on_connect);
+	                             temporal_php_on_connect);
 }
 
-void tphp_connection_free(void *connection)
+void temporal_php_connection_free(void *connection)
 {
 	if (connection != NULL) {
 		temporal_core_client_free((TemporalCoreConnection *) connection);
@@ -194,7 +201,7 @@ void tphp_connection_free(void *connection)
 
 typedef struct {
 	void              *user_data;
-	tphp_rpc_done_cb   done;
+	temporal_php_rpc_done_cb   done;
 	void              *runtime;
 	char              *method;   /* copied */
 	uint8_t           *req;      /* copied */
@@ -203,9 +210,9 @@ typedef struct {
 	size_t             meta_count;
 	TemporalCoreByteArrayRef *meta_refs;
 	TemporalCoreRpcCallOptions options;
-} tphp_rpc_ctx;
+} temporal_php_rpc_ctx;
 
-static void tphp_rpc_ctx_free(tphp_rpc_ctx *c)
+static void temporal_php_rpc_ctx_free(temporal_php_rpc_ctx *c)
 {
 	for (size_t i = 0; i < c->meta_count; i++) {
 		free(c->meta_strings[i]);
@@ -218,7 +225,7 @@ static void tphp_rpc_ctx_free(tphp_rpc_ctx *c)
 }
 
 /* Copy a (small) core ByteArray into a heap C string; frees the core buffer. */
-static char *tphp_copy_str(void *runtime, const TemporalCoreByteArray *src, size_t *len_out)
+static char *temporal_php_copy_str(void *runtime, const TemporalCoreByteArray *src, size_t *len_out)
 {
 	char *out = NULL;
 	size_t len = 0;
@@ -237,14 +244,14 @@ static char *tphp_copy_str(void *runtime, const TemporalCoreByteArray *src, size
 	return out;
 }
 
-static void tphp_on_rpc(void *user_data, const TemporalCoreByteArray *success,
+static void temporal_php_on_rpc(void *user_data, const TemporalCoreByteArray *success,
                         uint32_t status_code, const TemporalCoreByteArray *failure_message,
                         const TemporalCoreByteArray *failure_details)
 {
-	tphp_rpc_ctx *c = (tphp_rpc_ctx *) user_data;
+	temporal_php_rpc_ctx *c = (temporal_php_rpc_ctx *) user_data;
 
 	/* Success bytes are handed up WITHOUT a copy: the core buffer itself is the
-	 * owner, released later by the reactor via tphp_response_free(). */
+	 * owner, released later by the reactor via temporal_php_response_free(). */
 	const uint8_t *ok = NULL;
 	size_t ok_len = 0;
 	void *ok_owner = NULL;
@@ -257,23 +264,23 @@ static void tphp_on_rpc(void *user_data, const TemporalCoreByteArray *success,
 	/* Failure message + serialized status details are small and rare: copy +
 	 * free now (only the large success payload is zero-copied). */
 	size_t fail_len = 0;
-	char *fail = tphp_copy_str(c->runtime, failure_message, &fail_len);
+	char *fail = temporal_php_copy_str(c->runtime, failure_message, &fail_len);
 	size_t details_len = 0;
-	char *details = tphp_copy_str(c->runtime, failure_details, &details_len);
+	char *details = temporal_php_copy_str(c->runtime, failure_details, &details_len);
 
 	c->done(c->user_data, ok, ok_len, ok_owner, status_code, fail, fail_len,
 	        (uint8_t *) details, details_len);
-	tphp_rpc_ctx_free(c);
+	temporal_php_rpc_ctx_free(c);
 }
 
-void tphp_rpc_call(void *runtime, void *connection, int service,
+void temporal_php_rpc_call(void *runtime, void *connection, int service,
                    const char *method, const uint8_t *req, size_t req_len,
                    uint32_t timeout_ms,
                    const char *const *metadata, size_t metadata_count,
                    void *cancel_token,
-                   void *user_data, tphp_rpc_done_cb done)
+                   void *user_data, temporal_php_rpc_done_cb done)
 {
-	tphp_rpc_ctx *c = (tphp_rpc_ctx *) calloc(1, sizeof(*c));
+	temporal_php_rpc_ctx *c = (temporal_php_rpc_ctx *) calloc(1, sizeof(*c));
 	if (c == NULL) {
 		done(user_data, NULL, 0, NULL, 0, strdup("temporal: out of memory"), 0, NULL, 0);
 		return;
@@ -287,7 +294,7 @@ void tphp_rpc_call(void *runtime, void *connection, int service,
 	c->req_len = req_len;
 	c->req = (uint8_t *) malloc(req_len > 0 ? req_len : 1);
 	if (c->method == NULL || c->req == NULL) {
-		tphp_rpc_ctx_free(c);
+		temporal_php_rpc_ctx_free(c);
 		done(user_data, NULL, 0, NULL, 0, strdup("temporal: out of memory"), 0, NULL, 0);
 		return;
 	}
@@ -321,22 +328,22 @@ void tphp_rpc_call(void *runtime, void *connection, int service,
 	}
 
 	temporal_core_client_rpc_call((TemporalCoreConnection *) connection, &c->options, c,
-	                              tphp_on_rpc);
+	                              temporal_php_on_rpc);
 }
 
-void *tphp_cancel_token_new(void)
+void *temporal_php_cancel_token_new(void)
 {
 	return temporal_core_cancellation_token_new();
 }
 
-void tphp_cancel_token_cancel(void *token)
+void temporal_php_cancel_token_cancel(void *token)
 {
 	if (token != NULL) {
 		temporal_core_cancellation_token_cancel((TemporalCoreCancellationToken *) token);
 	}
 }
 
-void tphp_cancel_token_free(void *token)
+void temporal_php_cancel_token_free(void *token)
 {
 	if (token != NULL) {
 		temporal_core_cancellation_token_free((TemporalCoreCancellationToken *) token);
@@ -345,18 +352,18 @@ void tphp_cancel_token_free(void *token)
 
 /* --- Worker ------------------------------------------------------------ */
 
-void *tphp_worker_new(void *connection, const char *ns, const char *task_queue,
-                      const tphp_worker_options_t *options, char **err_out)
+void *temporal_php_worker_new(void *connection, const char *ns, const char *task_queue,
+                      const temporal_php_worker_options_t *options, char **err_out)
 {
 	TemporalCoreWorkerOptions opt;
 	memset(&opt, 0, sizeof(opt));
 
-	opt.namespace_ = tphp_ref(ns);
-	opt.task_queue = tphp_ref(task_queue);
+	opt.namespace_ = temporal_php_ref(ns);
+	opt.task_queue = temporal_php_ref(task_queue);
 
 	/* No versioning. */
 	opt.versioning_strategy.tag = None;
-	opt.versioning_strategy.none.build_id = tphp_ref("");
+	opt.versioning_strategy.none.build_id = temporal_php_ref("");
 
 	/* Fixed-size slot suppliers. All four must be valid. */
 	opt.tuner.activity_slot_supplier.tag = FixedSize;
@@ -402,16 +409,12 @@ void *tphp_worker_new(void *connection, const char *ns, const char *task_queue,
 
 	if (result.worker == NULL) {
 		if (err_out != NULL) {
-			if (result.fail != NULL) {
-				*err_out = (char *) malloc(result.fail->size + 1);
-				if (*err_out != NULL) {
-					memcpy(*err_out, result.fail->data, result.fail->size);
-					(*err_out)[result.fail->size] = '\0';
-				}
-				temporal_core_byte_array_free((TemporalCoreRuntime *) tphp_g_runtime, result.fail);
-			} else {
-				*err_out = tphp_strdup("failed to create Temporal worker");
-			}
+			*err_out = temporal_php_dup_fail(result.fail, "failed to create Temporal worker");
+		}
+		/* Unlike runtime_new, a live runtime exists here to free the buffer
+		 * through — and we free it regardless of err_out (no leak when NULL). */
+		if (result.fail != NULL) {
+			temporal_core_byte_array_free((TemporalCoreRuntime *) temporal_php_g_runtime, result.fail);
 		}
 		return NULL;
 	}
@@ -419,14 +422,14 @@ void *tphp_worker_new(void *connection, const char *ns, const char *task_queue,
 	return result.worker;
 }
 
-void tphp_worker_free(void *worker)
+void temporal_php_worker_free(void *worker)
 {
 	if (worker != NULL) {
 		temporal_core_worker_free((TemporalCoreWorker *) worker);
 	}
 }
 
-void tphp_worker_initiate_shutdown(void *worker)
+void temporal_php_worker_initiate_shutdown(void *worker)
 {
 	if (worker != NULL) {
 		temporal_core_worker_initiate_shutdown((TemporalCoreWorker *) worker);
@@ -436,13 +439,13 @@ void tphp_worker_initiate_shutdown(void *worker)
 /* poll ctx: carries the Zend-side call struct + the delivery callback. */
 typedef struct {
 	void                *user_data;
-	tphp_worker_poll_cb  done;
-} tphp_poll_ctx;
+	temporal_php_worker_poll_cb  done;
+} temporal_php_poll_ctx;
 
-static void tphp_on_worker_poll(void *user_data, const TemporalCoreByteArray *success,
+static void temporal_php_on_worker_poll(void *user_data, const TemporalCoreByteArray *success,
                                 const TemporalCoreByteArray *fail)
 {
-	tphp_poll_ctx *c = (tphp_poll_ctx *) user_data;
+	temporal_php_poll_ctx *c = (temporal_php_poll_ctx *) user_data;
 
 	/* Task bytes are handed up zero-copy (the core buffer is the owner). */
 	const uint8_t *task = NULL;
@@ -455,16 +458,16 @@ static void tphp_on_worker_poll(void *user_data, const TemporalCoreByteArray *su
 	}
 
 	size_t fail_len = 0;
-	char *failmsg = tphp_copy_str(tphp_g_runtime, fail, &fail_len);
+	char *failmsg = temporal_php_copy_str(temporal_php_g_runtime, fail, &fail_len);
 
 	/* success==NULL && fail==NULL means a shutdown poll. */
 	c->done(c->user_data, task, task_len, task_owner, failmsg, fail_len);
 	free(c);
 }
 
-void tphp_worker_poll_activity(void *worker, void *user_data, tphp_worker_poll_cb done)
+void temporal_php_worker_poll_activity(void *worker, void *user_data, temporal_php_worker_poll_cb done)
 {
-	tphp_poll_ctx *c = (tphp_poll_ctx *) calloc(1, sizeof(*c));
+	temporal_php_poll_ctx *c = (temporal_php_poll_ctx *) calloc(1, sizeof(*c));
 	if (c == NULL) {
 		done(user_data, NULL, 0, NULL, strdup("temporal: out of memory"), 0);
 		return;
@@ -472,32 +475,32 @@ void tphp_worker_poll_activity(void *worker, void *user_data, tphp_worker_poll_c
 	c->user_data = user_data;
 	c->done = done;
 
-	temporal_core_worker_poll_activity_task((TemporalCoreWorker *) worker, c, tphp_on_worker_poll);
+	temporal_core_worker_poll_activity_task((TemporalCoreWorker *) worker, c, temporal_php_on_worker_poll);
 }
 
 /* done ctx: carries the call struct + callback (+ a completion copy, if any). */
 typedef struct {
 	void                *user_data;
-	tphp_worker_done_cb  done;
+	temporal_php_worker_done_cb  done;
 	uint8_t             *completion;   /* copied; NULL for shutdown finalize */
-} tphp_worker_done_ctx;
+} temporal_php_worker_done_ctx;
 
-static void tphp_on_worker_done(void *user_data, const TemporalCoreByteArray *fail)
+static void temporal_php_on_worker_done(void *user_data, const TemporalCoreByteArray *fail)
 {
-	tphp_worker_done_ctx *c = (tphp_worker_done_ctx *) user_data;
+	temporal_php_worker_done_ctx *c = (temporal_php_worker_done_ctx *) user_data;
 
 	size_t fail_len = 0;
-	char *failmsg = tphp_copy_str(tphp_g_runtime, fail, &fail_len);
+	char *failmsg = temporal_php_copy_str(temporal_php_g_runtime, fail, &fail_len);
 
 	c->done(c->user_data, failmsg, fail_len);
 	free(c->completion);
 	free(c);
 }
 
-void tphp_worker_complete_activity(void *worker, const uint8_t *completion, size_t len,
-                                   void *user_data, tphp_worker_done_cb done)
+void temporal_php_worker_complete_activity(void *worker, const uint8_t *completion, size_t len,
+                                   void *user_data, temporal_php_worker_done_cb done)
 {
-	tphp_worker_done_ctx *c = (tphp_worker_done_ctx *) calloc(1, sizeof(*c));
+	temporal_php_worker_done_ctx *c = (temporal_php_worker_done_ctx *) calloc(1, sizeof(*c));
 	if (c != NULL) {
 		c->completion = (uint8_t *) malloc(len > 0 ? len : 1);
 	}
@@ -518,14 +521,14 @@ void tphp_worker_complete_activity(void *worker, const uint8_t *completion, size
 	ref.size = len;
 
 	temporal_core_worker_complete_activity_task((TemporalCoreWorker *) worker, ref, c,
-	                                            tphp_on_worker_done);
+	                                            temporal_php_on_worker_done);
 }
 
 /* Workflow poll/complete reuse the generic poll/done callbacks above; only the
  * underlying bridge call differs. */
-void tphp_worker_poll_workflow(void *worker, void *user_data, tphp_worker_poll_cb done)
+void temporal_php_worker_poll_workflow(void *worker, void *user_data, temporal_php_worker_poll_cb done)
 {
-	tphp_poll_ctx *c = (tphp_poll_ctx *) calloc(1, sizeof(*c));
+	temporal_php_poll_ctx *c = (temporal_php_poll_ctx *) calloc(1, sizeof(*c));
 	if (c == NULL) {
 		done(user_data, NULL, 0, NULL, strdup("temporal: out of memory"), 0);
 		return;
@@ -533,13 +536,13 @@ void tphp_worker_poll_workflow(void *worker, void *user_data, tphp_worker_poll_c
 	c->user_data = user_data;
 	c->done = done;
 
-	temporal_core_worker_poll_workflow_activation((TemporalCoreWorker *) worker, c, tphp_on_worker_poll);
+	temporal_core_worker_poll_workflow_activation((TemporalCoreWorker *) worker, c, temporal_php_on_worker_poll);
 }
 
-void tphp_worker_complete_workflow(void *worker, const uint8_t *completion, size_t len,
-                                   void *user_data, tphp_worker_done_cb done)
+void temporal_php_worker_complete_workflow(void *worker, const uint8_t *completion, size_t len,
+                                   void *user_data, temporal_php_worker_done_cb done)
 {
-	tphp_worker_done_ctx *c = (tphp_worker_done_ctx *) calloc(1, sizeof(*c));
+	temporal_php_worker_done_ctx *c = (temporal_php_worker_done_ctx *) calloc(1, sizeof(*c));
 	if (c != NULL) {
 		c->completion = (uint8_t *) malloc(len > 0 ? len : 1);
 	}
@@ -559,12 +562,12 @@ void tphp_worker_complete_workflow(void *worker, const uint8_t *completion, size
 	ref.size = len;
 
 	temporal_core_worker_complete_workflow_activation((TemporalCoreWorker *) worker, ref, c,
-	                                                  tphp_on_worker_done);
+	                                                  temporal_php_on_worker_done);
 }
 
-void tphp_worker_finalize_shutdown(void *worker, void *user_data, tphp_worker_done_cb done)
+void temporal_php_worker_finalize_shutdown(void *worker, void *user_data, temporal_php_worker_done_cb done)
 {
-	tphp_worker_done_ctx *c = (tphp_worker_done_ctx *) calloc(1, sizeof(*c));
+	temporal_php_worker_done_ctx *c = (temporal_php_worker_done_ctx *) calloc(1, sizeof(*c));
 	if (c == NULL) {
 		done(user_data, strdup("temporal: out of memory"), 0);
 		return;
@@ -572,10 +575,10 @@ void tphp_worker_finalize_shutdown(void *worker, void *user_data, tphp_worker_do
 	c->user_data = user_data;
 	c->done = done;
 
-	temporal_core_worker_finalize_shutdown((TemporalCoreWorker *) worker, c, tphp_on_worker_done);
+	temporal_core_worker_finalize_shutdown((TemporalCoreWorker *) worker, c, temporal_php_on_worker_done);
 }
 
-char *tphp_worker_record_heartbeat(void *worker, const uint8_t *heartbeat, size_t len)
+char *temporal_php_worker_record_heartbeat(void *worker, const uint8_t *heartbeat, size_t len)
 {
 	TemporalCoreByteArrayRef ref;
 	ref.data = heartbeat;
@@ -585,5 +588,5 @@ char *tphp_worker_record_heartbeat(void *worker, const uint8_t *heartbeat, size_
 		temporal_core_worker_record_activity_heartbeat((TemporalCoreWorker *) worker, ref);
 
 	size_t fail_len = 0;
-	return tphp_copy_str(tphp_g_runtime, fail, &fail_len);
+	return temporal_php_copy_str(temporal_php_g_runtime, fail, &fail_len);
 }

@@ -14,8 +14,10 @@
   through this header, passing opaque pointers and plain C types. This split also
   keeps the Tokio-thread callback path free of Zend/TSRM, by design.
 
-  Wrappers are prefixed `tphp_` to avoid colliding with the bridge's own
-  `temporal_core_*` symbols.
+  Shim functions use the `temporal_php_` prefix: distinct from the Zend-facing
+  layer (`temporal_*`, in temporal.c / temporal_client.c) and from the bridge's
+  own `temporal_core_*` symbols, so the prefix alone tells you which layer a
+  function belongs to.
 */
 
 #ifndef PHP_TEMPORAL_CORE_H
@@ -28,8 +30,8 @@
 
 /* Create the core runtime. Returns an opaque handle, or NULL with *err_out set
  * to a heap-allocated message the caller must free(). */
-void *tphp_runtime_new(char **err_out);
-void  tphp_runtime_free(void *runtime);
+void *temporal_php_runtime_new(char **err_out);
+void  temporal_php_runtime_free(void *runtime);
 
 /* --- Client connect ---------------------------------------------------- */
 
@@ -44,19 +46,19 @@ typedef struct {
 	const char *tls_client_cert;
 	const char *tls_client_private_key;
 	const char *tls_server_name;
-} tphp_connect_params_t;
+} temporal_php_connect_params_t;
 
 /* Delivery callback, invoked on a core (Tokio) thread when connect finishes.
  * Exactly one of `connection` / `fail` is non-NULL. `fail` is a heap string;
  * ownership passes to the callback. The callback must be Zend/TSRM-free. */
-typedef void (*tphp_connect_done_cb)(void *user_data, void *connection, char *fail);
+typedef void (*temporal_php_connect_done_cb)(void *user_data, void *connection, char *fail);
 
 /* Start an async connect. params and its strings are copied internally, so the
  * caller need not keep them alive past this call. */
-void tphp_connect(void *runtime, const tphp_connect_params_t *params,
-                  void *user_data, tphp_connect_done_cb done);
+void temporal_php_connect(void *runtime, const temporal_php_connect_params_t *params,
+                  void *user_data, temporal_php_connect_done_cb done);
 
-void tphp_connection_free(void *connection);
+void temporal_php_connection_free(void *connection);
 
 /* --- Async RPC --------------------------------------------------------- */
 
@@ -72,9 +74,9 @@ enum {
 /* Delivery callback, invoked on a core (Tokio) thread when the RPC finishes.
  * On success `success` (`success_len` bytes) points into the core-owned buffer
  * `success_owner` — NOT copied; the reactor reads it directly and then releases
- * it with tphp_response_free(). On failure `fail` (heap string, `fail_len` bytes)
+ * it with temporal_php_response_free(). On failure `fail` (heap string, `fail_len` bytes)
  * and `status_code` carry the gRPC error. Must be Zend/TSRM-free. */
-typedef void (*tphp_rpc_done_cb)(void *user_data,
+typedef void (*temporal_php_rpc_done_cb)(void *user_data,
                                  const uint8_t *success, size_t success_len, void *success_owner,
                                  uint32_t status_code,
                                  char *fail, size_t fail_len,
@@ -84,24 +86,24 @@ typedef void (*tphp_rpc_done_cb)(void *user_data,
  * internally. Each `metadata[i]` is a NUL-terminated "<key>\n<value>" string
  * (the core's metadata wire form); pass NULL/0 for none. `cancel_token` (or NULL)
  * lets the caller abort the in-flight RPC; the core clones it internally. */
-void tphp_rpc_call(void *runtime, void *connection, int service,
+void temporal_php_rpc_call(void *runtime, void *connection, int service,
                    const char *method, const uint8_t *req, size_t req_len,
                    uint32_t timeout_ms,
                    const char *const *metadata, size_t metadata_count,
                    void *cancel_token,
-                   void *user_data, tphp_rpc_done_cb done);
+                   void *user_data, temporal_php_rpc_done_cb done);
 
 /* Cancellation token for an in-flight RPC. Create on the reactor, hand to
- * tphp_rpc_call, call cancel() to abort the call promptly, then free(). The core
+ * temporal_php_rpc_call, call cancel() to abort the call promptly, then free(). The core
  * clones the token internally, so the wrapper is owned solely by the reactor
  * side — no cross-thread races. cancel() is idempotent. */
-void *tphp_cancel_token_new(void);
-void  tphp_cancel_token_cancel(void *token);
-void  tphp_cancel_token_free(void *token);
+void *temporal_php_cancel_token_new(void);
+void  temporal_php_cancel_token_cancel(void *token);
+void  temporal_php_cancel_token_free(void *token);
 
-/* Release a core-owned response buffer handed to tphp_rpc_done_cb as
+/* Release a core-owned response buffer handed to temporal_php_rpc_done_cb as
  * `success_owner`. Safe to call from any thread; no-op on NULL. */
-void tphp_response_free(void *response_owner);
+void temporal_php_response_free(void *response_owner);
 
 /* --- Worker ------------------------------------------------------------ */
 
@@ -118,41 +120,41 @@ typedef struct {
 	uint32_t activity_pollers;
 	uint32_t workflow_pollers;
 	uint32_t nexus_pollers;
-} tphp_worker_options_t;
+} temporal_php_worker_options_t;
 
 /* Create a worker on a task queue handling both workflow and activity tasks.
  * Returns an opaque handle, or NULL with *err_out (heap, caller frees).
  * worker_new is synchronous in the core. */
-void *tphp_worker_new(void *connection, const char *ns, const char *task_queue,
-                      const tphp_worker_options_t *options, char **err_out);
-void  tphp_worker_free(void *worker);
-void  tphp_worker_initiate_shutdown(void *worker);
+void *temporal_php_worker_new(void *connection, const char *ns, const char *task_queue,
+                      const temporal_php_worker_options_t *options, char **err_out);
+void  temporal_php_worker_free(void *worker);
+void  temporal_php_worker_initiate_shutdown(void *worker);
 
 /* Poll delivery (core thread). Exactly one case:
  *   - a task   : `task` (`task_len` bytes) borrows the core-owned `task_owner`
- *                (release with tphp_response_free); `fail` is NULL.
+ *                (release with temporal_php_response_free); `fail` is NULL.
  *   - shutdown : task, task_owner AND fail are all NULL.
  *   - error    : `fail` (heap) is set.
  * Must be Zend/TSRM-free. */
-typedef void (*tphp_worker_poll_cb)(void *user_data,
+typedef void (*temporal_php_worker_poll_cb)(void *user_data,
                                     const uint8_t *task, size_t task_len, void *task_owner,
                                     char *fail, size_t fail_len);
-void tphp_worker_poll_activity(void *worker, void *user_data, tphp_worker_poll_cb done);
-void tphp_worker_poll_workflow(void *worker, void *user_data, tphp_worker_poll_cb done);
+void temporal_php_worker_poll_activity(void *worker, void *user_data, temporal_php_worker_poll_cb done);
+void temporal_php_worker_poll_workflow(void *worker, void *user_data, temporal_php_worker_poll_cb done);
 
 /* Completion of a void worker op (complete activity/workflow, finalize shutdown).
  * `fail` (heap) is NULL on success. Must be Zend/TSRM-free. */
-typedef void (*tphp_worker_done_cb)(void *user_data, char *fail, size_t fail_len);
-void tphp_worker_complete_activity(void *worker, const uint8_t *completion, size_t len,
-                                   void *user_data, tphp_worker_done_cb done);
-void tphp_worker_complete_workflow(void *worker, const uint8_t *completion, size_t len,
-                                   void *user_data, tphp_worker_done_cb done);
-void tphp_worker_finalize_shutdown(void *worker, void *user_data, tphp_worker_done_cb done);
+typedef void (*temporal_php_worker_done_cb)(void *user_data, char *fail, size_t fail_len);
+void temporal_php_worker_complete_activity(void *worker, const uint8_t *completion, size_t len,
+                                   void *user_data, temporal_php_worker_done_cb done);
+void temporal_php_worker_complete_workflow(void *worker, const uint8_t *completion, size_t len,
+                                   void *user_data, temporal_php_worker_done_cb done);
+void temporal_php_worker_finalize_shutdown(void *worker, void *user_data, temporal_php_worker_done_cb done);
 
 /* Record an activity heartbeat (serialized coresdk ActivityHeartbeat).
  * Synchronous in the core: it only stores the heartbeat in memory; throttling
  * and the server RPC happen later on the core's own threads. Returns NULL on
  * success, or a heap error message (decode failure) the caller frees. */
-char *tphp_worker_record_heartbeat(void *worker, const uint8_t *heartbeat, size_t len);
+char *temporal_php_worker_record_heartbeat(void *worker, const uint8_t *heartbeat, size_t len);
 
 #endif /* PHP_TEMPORAL_CORE_H */
