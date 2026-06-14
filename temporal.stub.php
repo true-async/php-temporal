@@ -37,7 +37,9 @@ namespace TrueAsync\Temporal\Core;
 /**
  * Low-level transport over the Temporal Rust core. Each call parks the current
  * coroutine while the core runs the gRPC on its own threads, then resumes it
- * through a cross-thread trigger. Must be used inside a coroutine.
+ * through a cross-thread trigger. Called outside a coroutine (the top-level
+ * flow), it launches the scheduler and runs as the main coroutine — no explicit
+ * Async\spawn() wrapper is required, just like Async\await().
  */
 final class Connection
 {

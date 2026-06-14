@@ -30,6 +30,21 @@
 #include "temporal_internal.h"
 #include "temporal_core.h"
 
+/* When a suspending Core method is called outside any coroutine (the top-level
+ * "main" flow), launch the scheduler — it converts the current execution into
+ * the main coroutine — so the call works without an explicit Async\spawn()
+ * wrapper, exactly as Async\await() / Async\delay() do (ext/async's
+ * SCHEDULER_LAUNCH). Only the launch itself failing (e.g. the reactor is
+ * disabled) throws and returns. */
+#define TEMPORAL_ENSURE_COROUTINE() \
+	do { \
+		if (UNEXPECTED(ZEND_ASYNC_CURRENT_COROUTINE == NULL)) { \
+			if (!ZEND_ASYNC_SCHEDULER_LAUNCH()) { \
+				RETURN_THROWS(); \
+			} \
+		} \
+	} while (0)
+
 /* ====================================================================== */
 /* Refcounted core-handle owner                                           */
 /* ====================================================================== */
@@ -633,11 +648,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Connection, __construct)
 		Z_PARAM_STR_OR_NULL(tls_server_name)
 	ZEND_PARSE_PARAMETERS_END();
 
-	if (ZEND_ASYNC_CURRENT_COROUTINE == NULL) {
-		zend_throw_error(NULL,
-			"TrueAsync\\Temporal\\Core\\Connection must be constructed within a coroutine");
-		RETURN_THROWS();
-	}
+	TEMPORAL_ENSURE_COROUTINE();
 
 	const char *addr = ZSTR_VAL(address);
 	char *target_url;
@@ -728,10 +739,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Connection, rpcCall)
 		RETURN_THROWS();
 	}
 
-	if (ZEND_ASYNC_CURRENT_COROUTINE == NULL) {
-		zend_throw_error(NULL, "rpcCall must be called within a coroutine");
-		RETURN_THROWS();
-	}
+	TEMPORAL_ENSURE_COROUTINE();
 
 	if (timeout_ms < 0 || timeout_ms > UINT32_MAX) {
 		zend_value_error("rpcCall timeout must be between 0 and %u milliseconds", UINT32_MAX);
@@ -927,10 +935,11 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, pollActivityTask)
 
 	temporal_worker_obj *self = temporal_worker_from_obj(Z_OBJ_P(ZEND_THIS));
 
-	if (self->worker == NULL || self->finalized || ZEND_ASYNC_CURRENT_COROUTINE == NULL) {
-		zend_throw_error(NULL, "pollActivityTask must be called on a live worker within a coroutine");
+	if (self->worker == NULL || self->finalized) {
+		zend_throw_error(NULL, "pollActivityTask must be called on a live worker");
 		RETURN_THROWS();
 	}
+	TEMPORAL_ENSURE_COROUTINE();
 
 	temporal_outcome_t out;
 	temporal_run_worker_poll((temporal_php_handle_t *) self->worker, temporal_php_worker_poll_activity, &out);
@@ -959,10 +968,11 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, pollWorkflowActivation)
 
 	temporal_worker_obj *self = temporal_worker_from_obj(Z_OBJ_P(ZEND_THIS));
 
-	if (self->worker == NULL || self->finalized || ZEND_ASYNC_CURRENT_COROUTINE == NULL) {
-		zend_throw_error(NULL, "pollWorkflowActivation must be called on a live worker within a coroutine");
+	if (self->worker == NULL || self->finalized) {
+		zend_throw_error(NULL, "pollWorkflowActivation must be called on a live worker");
 		RETURN_THROWS();
 	}
+	TEMPORAL_ENSURE_COROUTINE();
 
 	temporal_outcome_t out;
 	temporal_run_worker_poll((temporal_php_handle_t *) self->worker, temporal_php_worker_poll_workflow, &out);
@@ -995,10 +1005,11 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, completeActivityTask)
 
 	temporal_worker_obj *self = temporal_worker_from_obj(Z_OBJ_P(ZEND_THIS));
 
-	if (self->worker == NULL || self->finalized || ZEND_ASYNC_CURRENT_COROUTINE == NULL) {
-		zend_throw_error(NULL, "completeActivityTask must be called on a live worker within a coroutine");
+	if (self->worker == NULL || self->finalized) {
+		zend_throw_error(NULL, "completeActivityTask must be called on a live worker");
 		RETURN_THROWS();
 	}
+	TEMPORAL_ENSURE_COROUTINE();
 
 	temporal_outcome_t out;
 	temporal_run_worker_complete((temporal_php_handle_t *) self->worker, temporal_php_worker_complete_activity,
@@ -1025,10 +1036,11 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, completeWorkflowActivation)
 
 	temporal_worker_obj *self = temporal_worker_from_obj(Z_OBJ_P(ZEND_THIS));
 
-	if (self->worker == NULL || self->finalized || ZEND_ASYNC_CURRENT_COROUTINE == NULL) {
-		zend_throw_error(NULL, "completeWorkflowActivation must be called on a live worker within a coroutine");
+	if (self->worker == NULL || self->finalized) {
+		zend_throw_error(NULL, "completeWorkflowActivation must be called on a live worker");
 		RETURN_THROWS();
 	}
+	TEMPORAL_ENSURE_COROUTINE();
 
 	temporal_outcome_t out;
 	temporal_run_worker_complete((temporal_php_handle_t *) self->worker, temporal_php_worker_complete_workflow,
@@ -1090,10 +1102,11 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, finalizeShutdown)
 
 	temporal_worker_obj *self = temporal_worker_from_obj(Z_OBJ_P(ZEND_THIS));
 
-	if (self->worker == NULL || self->finalized || ZEND_ASYNC_CURRENT_COROUTINE == NULL) {
-		zend_throw_error(NULL, "finalizeShutdown must be called on a live worker within a coroutine");
+	if (self->worker == NULL || self->finalized) {
+		zend_throw_error(NULL, "finalizeShutdown must be called on a live worker");
 		RETURN_THROWS();
 	}
+	TEMPORAL_ENSURE_COROUTINE();
 
 	/* No settle race here: our vendored core (true-async/sdk-rust) drops each
 	 * poll/complete task's worker clone before waking us (notify-after-release),
