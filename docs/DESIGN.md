@@ -34,9 +34,10 @@ Officialness, component by component:
 │ (composer pkg)     Worker, options, enums, exceptions,        │
 │                    DataConverter}  +  generated Temporal\Api\* │
 ├──────────────────────────────────────────────────────────────┤
-│ PHP ext (C)        thin core: runtime + Core\Connection        │
-│                    (connect, rpcCall) — bytes in → bytes out,  │
-│                    cross-thread trigger → coroutine resume     │
+│ PHP ext (C)        thin core: runtime, Core\Connection         │
+│                    (connect, rpcCall) + Core\Worker            │
+│                    (poll/complete, heartbeat, shutdown);       │
+│                    bytes in → bytes out, trigger → resume      │
 ├──────────────────────────────────────────────────────────────┤
 │ C ABI              temporal-sdk-core-c-bridge.h                │
 ├──────────────────────────────────────────────────────────────┤
@@ -45,9 +46,11 @@ Officialness, component by component:
 └──────────────────────────────────────────────────────────────┘
 ```
 
-**Split (resolved, see §9.6):** the C extension is a *thin core* — runtime plus
-`Core\Connection` exposing `connect` and an async `rpcCall(service, method,
-bytes): bytes`. Everything user-facing — the high-level `Client`/`WorkflowHandle`,
+**Split (resolved, see §9.6):** the C extension is a *thin core* — runtime,
+`Core\Connection` (`connect` + async `rpcCall(service, method, bytes): bytes`)
+and `Core\Worker` (poll/complete for activity tasks and workflow activations,
+heartbeat recording, shutdown lifecycle). Everything user-facing — the high-level
+`Client`/`WorkflowHandle`,
 the typed options/enums/exceptions, the generated `Temporal\Api\*` protobuf
 messages and the pluggable data converter — lives in a **PHP composer package**.
 
@@ -133,15 +136,17 @@ Zend-owned. It only stashes a pointer and pulls the trigger. All Zend-touching
 work happens back on the reactor thread inside the resumed coroutine. This keeps
 us clear of TSRM/GC races and matches the project rule above.
 
-Two building blocks, pick per call site:
-
-* **One-shot RPC** (start, signal, query, getResult): a **thread-safe future**
-  (`zend_async_new_future_t(thread_safe = true, ...)`). The Tokio callback
-  completes or rejects it; the coroutine `await`s it. Cleanest for request →
-  response.
-* **Repeated poll loop** (worker): a raw trigger plus a small MPSC-style queue,
-  so successive poll completions can be drained without re-arming a fresh future
-  each time.
+**One building block, used for every op** (connect, rpcCall, poll, complete,
+finalize): a refcounted `temporal_call_t` — one ref for the awaiter, one for the
+in-flight op — carrying a trigger. `temporal_run_*` arms it (`resume_when` +
+`start`), launches the async core call, then `temporal_call_collect` suspends the
+coroutine and, on resume, copies the result out under the call's mutex. The Tokio
+callback writes the result and pulls the trigger; whoever drops the last ref
+frees the struct, so a late callback after a cancelled await still lands safely
+on an orphan path that drops the delivered result. The same shape serves both the
+one-shot RPCs and the repeated worker poll loop — no separate future or queue
+machinery (this is where the design's earlier "thread-safe future + MPSC queue"
+sketch converged).
 
 ### Cancellation
 
@@ -157,15 +162,22 @@ after the callback has run, mirroring the flock-cancel ownership pattern in
 
 * **Runtime**: one `TemporalCoreRuntime` per process (module globals), created in
   MINIT after the reactor exists, freed in MSHUTDOWN after `quiesce`.
-* **Client/Connection**: created per `Client` object; `temporal_core_client_free`
-  in the object free handler. The connect is itself async (callback) so the
-  constructor suspends the coroutine until connected.
+* **Client/Connection & Worker**: the `TemporalCoreConnection` /
+  `TemporalCoreWorker` is wrapped in a refcounted `temporal_php_handle_t` — the
+  zend object holds one ref, each in-flight op adds one — so an op keeps the
+  handle alive until its callback fires even if the zend object was already
+  destroyed (e.g. by a cancel). The last ref runs `temporal_core_client_free` /
+  `temporal_core_worker_free`, on whichever thread drops it. Connect is itself
+  async, so the constructor suspends the coroutine until connected.
 * **Byte arrays**: every `success`/`failure_details` buffer returned by the core
   is freed with `temporal_core_byte_array_free(runtime, buf)` once copied into a
-  PHP string, on the reactor thread.
-* **Result slot**: the per-call struct lives in the trigger's `extra_size` tail
-  (`ZEND_ASYNC_NEW_TRIGGER_EVENT_EX(sizeof(slot))`) or in the thread-safe future
-  state, so its lifetime is tied to the awaited event, not the C stack.
+  PHP string, on the reactor thread. (Large success payloads are handed up
+  zero-copy and freed by the reactor after it reads them.)
+* **Call struct**: each op gets a separately heap-allocated, refcounted
+  `temporal_call_t` (`ZEND_ASYNC_NEW_TRIGGER_EVENT()` for the wake), not tied to
+  the C stack. It is freed when the last of {awaiter, in-flight op} drops its
+  ref, so neither a cancelled coroutine nor a late Tokio callback can free it out
+  from under the other.
 
 ## 6. Protobuf strategy
 
@@ -186,15 +198,18 @@ fallback acceptable.
 
 ## 7. Phasing
 
-**Phase 1 — Client (starter).** `connect` + `rpc_call` only. Start / signal /
+*Status: Phases 1 and 2 are complete; Phase 3's base lifecycle is complete (see
+the "Implementation note (as shipped)" at the end of this section).*
+
+**Phase 1 — Client (starter). ✅** `connect` + `rpc_call` only. Start / signal /
 query / getResult / describe / cancel / terminate. High value, low complexity,
 no determinism concerns. This is the concrete surface in `temporal.stub.php`.
 
-**Phase 2 — Activity worker.** Poll activity tasks, run the PHP activity in a
+**Phase 2 — Activity worker. ✅** Poll activity tasks, run the PHP activity in a
 normal TrueAsync coroutine (real I/O, this is exactly what TrueAsync is good
 at), complete back through the core. Heartbeating maps to a timer + RPC.
 
-**Phase 3 — Workflow worker (the hard part).** Temporal workflows must be
+**Phase 3 — Workflow worker (the hard part). ◐ base lifecycle done.** Temporal workflows must be
 **deterministic and replayable**: time, randomness and every await must come
 from history, never from the live reactor.
 
@@ -241,12 +256,14 @@ current design.
 
 ## 8. Build & dependencies
 
-* `sdk-core-c-bridge` built via `cargo` as a `staticlib`/`cdylib`; vendored as a
-  git submodule under `third_party/sdk-rust` (mirrors how php-clickhouse vendors
-  `clickhouse-cpp` under `third_party/`).
-* `config.m4` / `configure.ac`: locate Rust/cargo, build the bridge, then
-  compile and link the PHP extension against the produced library + the C header
-  include dir. ZTS required (TrueAsync).
+* `sdk-core-c-bridge` is built **separately, ahead of `configure`**, with
+  `cargo build --release` as a `cdylib`; vendored as a git submodule under
+  `third_party/sdk-rust` — our fork `true-async/sdk-rust` (v0.4.0 + a worker-
+  shutdown fix, see CHANGELOG), pending upstream `temporalio/sdk-rust#1330`.
+* `config.m4` does **not** build the bridge: it locates the prebuilt
+  `libtemporalio_sdk_core_c_bridge.so` (erroring with the exact cargo command if
+  it is missing), adds the C header include dir, and links the extension against
+  it with an rpath to the cargo target dir. ZTS required (TrueAsync).
 * `google/protobuf` PHP runtime for the generated message classes.
 
 ## 9. Open questions for review

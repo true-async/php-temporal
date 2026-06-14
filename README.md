@@ -6,6 +6,7 @@
 *Write sync, run async.*
 
 [![PHP](https://img.shields.io/badge/PHP-8.x_ZTS-777BB4?style=flat-square&logo=php&logoColor=white)](https://www.php.net/)
+[![PHP TrueAsync](https://img.shields.io/badge/runtime-PHP_TrueAsync-4F5B93?style=flat-square&logo=php&logoColor=white)](https://github.com/true-async/php-async)
 [![Temporal](https://img.shields.io/badge/Temporal-Rust_Core-000000?style=flat-square&logo=temporal&logoColor=white)](https://github.com/temporalio/sdk-rust)
 [![License](https://img.shields.io/badge/license-Apache_2.0-blue?style=flat-square)](LICENSE)
 
@@ -22,6 +23,8 @@ The **high-level client API is the reused official Temporal PHP SDK** (the
 `Temporal\*` namespace), driven through a `ServiceClientInterface` adapter over
 this transport — see the [`true-async/sdk-php`](https://github.com/true-async/sdk-php)
 fork (branch `true-async`), which strips gRPC/RoadRunner from the dependencies.
+
+A **client** starting a workflow over the transport:
 
 ```php
 use Temporal\Client\WorkflowClient;
@@ -40,6 +43,30 @@ $run = await(spawn(function () {
         (new WorkflowOptions())->withTaskQueue('orders'));
 
     return $client->start($stub, $order);
+}));
+```
+
+And a **worker** serving that task queue — workflows and activities polled
+concurrently on the one reactor:
+
+```php
+use TrueAsync\Temporal\Core\Connection;
+use TrueAsync\Temporal\Core\Worker as CoreWorker;
+use Temporal\Worker\TrueAsync\TemporalWorker;
+use function Async\spawn;
+use function Async\await;
+
+await(spawn(function () {
+    $connection = new Connection('127.0.0.1:7233');
+    $core       = new CoreWorker($connection, 'orders');   // task queue
+
+    $worker = new TemporalWorker($core, 'orders');
+    $worker->registerWorkflowTypes(OrderWorkflow::class);
+    $worker->registerActivityImplementations(new OrderActivities());
+
+    // Long-polls workflow activations and activity tasks until shutdown;
+    // call $worker->shutdown() from another coroutine or a signal handler.
+    $worker->run();
 }));
 ```
 
