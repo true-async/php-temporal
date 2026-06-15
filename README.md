@@ -176,14 +176,28 @@ a live server today:
 - **Transport** (`Core\Connection`, `Core\Worker`) — reviewed, ASAN-clean,
   covered by the test suite and CI.
 - **Activity worker** — run, heartbeat, cooperative cancellation.
-- **Workflow worker** — the core lifecycle through the reused SDK engine:
-  start/complete, timers, activities, signals, queries, cancellation (of the
-  workflow, its timers, activities and child workflows), child workflows, and
-  continue-as-new.
+- **Workflow worker** — the lifecycle through the reused SDK engine:
+  start/complete, timers, activities (regular and local), signals, queries,
+  cancellation (of the workflow, its timers, activities and child workflows),
+  child workflows, continue-as-new, signalling and cancelling external/child
+  workflows, updates (validate/accept/reject/complete), upserting search
+  attributes (untyped and typed) and memo, and panic.
 
-In progress: the long tail of workflow commands — signal/cancel external
-workflow, updates, side effects, versioning/patches, local activities, and
-search attributes. These raise an explicit error rather than failing silently.
+In progress: versioning/patches (`GetVersion`), and the local-activity
+long-retry backoff path. Anything not yet mapped raises an explicit error rather
+than failing silently.
+
+**Side effects are intentionally not supported** (`Workflow::sideEffect()`, and
+`Workflow::uuid()`, which is built on it) — this is a property of the Rust core,
+not an omission here. The RoadRunner/Go host records a side effect's value as a
+workflow-history *marker* and replays it from history. The core's command
+protocol has no marker mechanism (only patch markers, for versioning) and no
+side-effect resolution job, so the value cannot be persisted for replay: running
+the closure on the first attempt only would yield a different — or absent — value
+when the run is later replayed, breaking determinism. The core's replacement for
+non-deterministic work is the **local activity** (supported), whose result the
+core itself records in history. The newer core-based SDKs (TypeScript, Python)
+omit `sideEffect()` for the same reason.
 
 ## Why
 
