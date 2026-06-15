@@ -45,6 +45,9 @@ transport through a `ServiceClientInterface` adapter — see the
   as a cancel-variant task from `pollActivityTask()`.
 - The worker now caches workflow runs (sticky execution) so a fired timer or
   resolved activity resumes the live instance instead of replaying from scratch.
+- The worker now dispatches local activities: a workflow can run them, and the
+  core executes them in-process and delivers them on `pollActivityTask()` like
+  regular activities.
 
 - `Core\Worker` now takes a tuning `$options` array (slot-supplier sizes, sticky
   cache size, sticky schedule-to-start timeout, graceful shutdown period, poller
