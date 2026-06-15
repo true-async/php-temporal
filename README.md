@@ -181,8 +181,9 @@ a live server today:
   cancellation (of the workflow, its timers, activities and child workflows),
   child workflows, continue-as-new, signalling and cancelling external/child
   workflows, updates (validate/accept/reject/complete), upserting search
-  attributes (untyped and typed) and memo, panic, and versioning
-  (`Workflow::getVersion()` / patches).
+  attributes (untyped and typed) and memo, panic, versioning
+  (`Workflow::getVersion()` / patches), and surviving a reset (the reset run's
+  new random seed is consumed and it re-executes cleanly).
 
 In progress: the local-activity long-retry backoff path. Anything not yet mapped
 raises an explicit error rather than failing silently.
