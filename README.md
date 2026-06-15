@@ -181,11 +181,11 @@ a live server today:
   cancellation (of the workflow, its timers, activities and child workflows),
   child workflows, continue-as-new, signalling and cancelling external/child
   workflows, updates (validate/accept/reject/complete), upserting search
-  attributes (untyped and typed) and memo, and panic.
+  attributes (untyped and typed) and memo, panic, and versioning
+  (`Workflow::getVersion()` / patches).
 
-In progress: versioning/patches (`GetVersion`), and the local-activity
-long-retry backoff path. Anything not yet mapped raises an explicit error rather
-than failing silently.
+In progress: the local-activity long-retry backoff path. Anything not yet mapped
+raises an explicit error rather than failing silently.
 
 **Side effects are intentionally not supported** (`Workflow::sideEffect()`, and
 `Workflow::uuid()`, which is built on it) — this is a property of the Rust core,
