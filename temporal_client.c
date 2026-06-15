@@ -45,6 +45,16 @@
 		} \
 	} while (0)
 
+/* Reject a worker op issued on a spent worker — never created, or finalized (its
+ * inner core worker has been taken). `name` is a string literal naming the method. */
+#define TEMPORAL_REQUIRE_LIVE_WORKER(self, name) \
+	do { \
+		if ((self)->worker == NULL || (self)->finalized) { \
+			zend_throw_error(NULL, name " must be called on a live worker"); \
+			RETURN_THROWS(); \
+		} \
+	} while (0)
+
 /* ====================================================================== */
 /* Refcounted core-handle owner                                           */
 /* ====================================================================== */
@@ -318,6 +328,34 @@ static temporal_call_t *temporal_call_new(void)
 	return call;
 }
 
+/* Allocate a call and arm its wakeup on `co`, ready for an async op to be
+ * launched against it. When `handle` is non-NULL it is kept alive for the op
+ * (an extra ref the call drops on free). Returns NULL with out->cancelled set
+ * and a pending exception on allocation failure. */
+static temporal_call_t *temporal_call_begin(temporal_php_handle_t *handle, zend_coroutine_t *co,
+                                            temporal_outcome_t *out)
+{
+	temporal_call_t *call = temporal_call_new();
+	if (call == NULL) {
+		out->cancelled = true;                   /* exception already pending */
+		memset(&out->r, 0, sizeof(out->r));
+		return NULL;
+	}
+
+	/* Keep the handle alive until this op's callback fires, even past a cancel. */
+	if (handle != NULL) {
+		call->handle = handle;
+		temporal_php_handle_addref(handle);
+	}
+
+	ZEND_ASYNC_WAKER_NEW(co);
+	zend_async_resume_when(co, &call->trigger->base, false,
+	                       zend_async_waker_callback_resolve, NULL);
+	call->trigger->base.start(&call->trigger->base);   /* keep the loop alive */
+
+	return call;
+}
+
 /* Suspend until the call completes, then collect the outcome and release the
  * call. On cancellation out->cancelled is set and any delivered result dropped. */
 static void temporal_call_collect(temporal_call_t *call, zend_coroutine_t *co,
@@ -371,17 +409,10 @@ static void temporal_run_connect(const temporal_php_connect_params_t *params, te
 {
 	zend_coroutine_t *co = ZEND_ASYNC_CURRENT_COROUTINE;
 
-	temporal_call_t *call = temporal_call_new();
+	temporal_call_t *call = temporal_call_begin(NULL, co, out);   /* connect owns no handle */
 	if (call == NULL) {
-		out->cancelled = true;                   /* exception already pending */
-		memset(&out->r, 0, sizeof(out->r));
 		return;
 	}
-
-	ZEND_ASYNC_WAKER_NEW(co);
-	zend_async_resume_when(co, &call->trigger->base, false,
-	                       zend_async_waker_callback_resolve, NULL);
-	call->trigger->base.start(&call->trigger->base);   /* keep the loop alive */
 
 	temporal_php_connect(temporal_runtime_handle, params, call, temporal_connect_done);
 	temporal_call_collect(call, co, out);
@@ -395,24 +426,15 @@ static void temporal_run_rpc(temporal_php_handle_t *handle, int service, const c
 {
 	zend_coroutine_t *co = ZEND_ASYNC_CURRENT_COROUTINE;
 
-	temporal_call_t *call = temporal_call_new();
+	temporal_call_t *call = temporal_call_begin(handle, co, out);
 	if (call == NULL) {
-		out->cancelled = true;
-		memset(&out->r, 0, sizeof(out->r));
 		return;
 	}
 
-	/* Keep the handle alive until this op's callback fires, even past a cancel. */
-	call->handle = handle;
-	temporal_php_handle_addref(handle);
-
-	/* A cancel token so a cancelled coroutine aborts the RPC promptly. */
+	/* A cancel token so a cancelled coroutine aborts the RPC promptly. No op can
+	 * fire the wakeup before the call below launches it, so setting this after
+	 * arming is safe. */
 	call->cancel_token = temporal_php_cancel_token_new();
-
-	ZEND_ASYNC_WAKER_NEW(co);
-	zend_async_resume_when(co, &call->trigger->base, false,
-	                       zend_async_waker_callback_resolve, NULL);
-	call->trigger->base.start(&call->trigger->base);
 
 	temporal_php_rpc_call(temporal_runtime_handle, handle->box, service, method, req, req_len,
 	              timeout_ms, metadata, metadata_count, call->cancel_token, call, temporal_rpc_done);
@@ -424,6 +446,26 @@ static void temporal_run_rpc(temporal_php_handle_t *handle, int service, const c
 static bool temporal_metadata_part_valid(const char *s, size_t len)
 {
 	return memchr(s, '\n', len) == NULL;
+}
+
+/* Append one "<key>\n<value>" wire entry to the parallel arrays at index *n,
+ * advancing it. Returns false (appending nothing) when the value embeds a
+ * newline, so the caller can bail out. */
+static bool temporal_metadata_append(zend_string *key, zval *value,
+                                     zend_string **zstrs, const char **ptrs, size_t *n)
+{
+	zend_string *s = zval_get_string(value);
+	if (!temporal_metadata_part_valid(ZSTR_VAL(s), ZSTR_LEN(s))) {
+		zend_string_release(s);
+		return false;
+	}
+
+	zend_string *kv = zend_strpprintf(0, "%s\n%s", ZSTR_VAL(key), ZSTR_VAL(s));
+	zstrs[*n] = kv;
+	ptrs[*n]  = ZSTR_VAL(kv);
+	(*n)++;
+	zend_string_release(s);
+	return true;
 }
 
 /* Flatten a PHP metadata map (key => string | list<string>) into the core's
@@ -461,28 +503,12 @@ static size_t temporal_flatten_metadata(HashTable *ht, zend_string ***zstrs, con
 		if (Z_TYPE_P(v) == IS_ARRAY) {
 			zval *item;
 			ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(v), item) {
-				zend_string *s = zval_get_string(item);
-				if (!temporal_metadata_part_valid(ZSTR_VAL(s), ZSTR_LEN(s))) {
-					zend_string_release(s);
+				if (!temporal_metadata_append(key, item, *zstrs, *ptrs, &n)) {
 					goto invalid;
 				}
-				zend_string *kv = zend_strpprintf(0, "%s\n%s", ZSTR_VAL(key), ZSTR_VAL(s));
-				(*zstrs)[n] = kv;
-				(*ptrs)[n] = ZSTR_VAL(kv);
-				n++;
-				zend_string_release(s);
 			} ZEND_HASH_FOREACH_END();
-		} else {
-			zend_string *s = zval_get_string(v);
-			if (!temporal_metadata_part_valid(ZSTR_VAL(s), ZSTR_LEN(s))) {
-				zend_string_release(s);
-				goto invalid;
-			}
-			zend_string *kv = zend_strpprintf(0, "%s\n%s", ZSTR_VAL(key), ZSTR_VAL(s));
-			(*zstrs)[n] = kv;
-			(*ptrs)[n] = ZSTR_VAL(kv);
-			n++;
-			zend_string_release(s);
+		} else if (!temporal_metadata_append(key, v, *zstrs, *ptrs, &n)) {
+			goto invalid;
 		}
 	} ZEND_HASH_FOREACH_END();
 
@@ -554,20 +580,10 @@ static void temporal_run_worker_poll(temporal_php_handle_t *handle,
 {
 	zend_coroutine_t *co = ZEND_ASYNC_CURRENT_COROUTINE;
 
-	temporal_call_t *call = temporal_call_new();
+	temporal_call_t *call = temporal_call_begin(handle, co, out);
 	if (call == NULL) {
-		out->cancelled = true;
-		memset(&out->r, 0, sizeof(out->r));
 		return;
 	}
-
-	call->handle = handle;
-	temporal_php_handle_addref(handle);
-
-	ZEND_ASYNC_WAKER_NEW(co);
-	zend_async_resume_when(co, &call->trigger->base, false,
-	                       zend_async_waker_callback_resolve, NULL);
-	call->trigger->base.start(&call->trigger->base);
 
 	poll(handle->box, call, temporal_worker_poll_done);
 	temporal_call_collect(call, co, out);
@@ -583,20 +599,10 @@ static void temporal_run_worker_complete(temporal_php_handle_t *handle,
 {
 	zend_coroutine_t *co = ZEND_ASYNC_CURRENT_COROUTINE;
 
-	temporal_call_t *call = temporal_call_new();
+	temporal_call_t *call = temporal_call_begin(handle, co, out);
 	if (call == NULL) {
-		out->cancelled = true;
-		memset(&out->r, 0, sizeof(out->r));
 		return;
 	}
-
-	call->handle = handle;
-	temporal_php_handle_addref(handle);
-
-	ZEND_ASYNC_WAKER_NEW(co);
-	zend_async_resume_when(co, &call->trigger->base, false,
-	                       zend_async_waker_callback_resolve, NULL);
-	call->trigger->base.start(&call->trigger->base);
 
 	complete(handle->box, completion, len, call, temporal_worker_op_done);
 	temporal_call_collect(call, co, out);
@@ -607,20 +613,10 @@ static void temporal_run_worker_finalize(temporal_php_handle_t *handle, temporal
 {
 	zend_coroutine_t *co = ZEND_ASYNC_CURRENT_COROUTINE;
 
-	temporal_call_t *call = temporal_call_new();
+	temporal_call_t *call = temporal_call_begin(handle, co, out);
 	if (call == NULL) {
-		out->cancelled = true;
-		memset(&out->r, 0, sizeof(out->r));
 		return;
 	}
-
-	call->handle = handle;
-	temporal_php_handle_addref(handle);
-
-	ZEND_ASYNC_WAKER_NEW(co);
-	zend_async_resume_when(co, &call->trigger->base, false,
-	                       zend_async_waker_callback_resolve, NULL);
-	call->trigger->base.start(&call->trigger->base);
 
 	temporal_php_worker_finalize_shutdown(handle->box, call, temporal_worker_op_done);
 	temporal_call_collect(call, co, out);
@@ -935,10 +931,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, pollActivityTask)
 
 	temporal_worker_obj *self = temporal_worker_from_obj(Z_OBJ_P(ZEND_THIS));
 
-	if (self->worker == NULL || self->finalized) {
-		zend_throw_error(NULL, "pollActivityTask must be called on a live worker");
-		RETURN_THROWS();
-	}
+	TEMPORAL_REQUIRE_LIVE_WORKER(self, "pollActivityTask");
 	TEMPORAL_ENSURE_COROUTINE();
 
 	temporal_outcome_t out;
@@ -968,10 +961,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, pollWorkflowActivation)
 
 	temporal_worker_obj *self = temporal_worker_from_obj(Z_OBJ_P(ZEND_THIS));
 
-	if (self->worker == NULL || self->finalized) {
-		zend_throw_error(NULL, "pollWorkflowActivation must be called on a live worker");
-		RETURN_THROWS();
-	}
+	TEMPORAL_REQUIRE_LIVE_WORKER(self, "pollWorkflowActivation");
 	TEMPORAL_ENSURE_COROUTINE();
 
 	temporal_outcome_t out;
@@ -1005,10 +995,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, completeActivityTask)
 
 	temporal_worker_obj *self = temporal_worker_from_obj(Z_OBJ_P(ZEND_THIS));
 
-	if (self->worker == NULL || self->finalized) {
-		zend_throw_error(NULL, "completeActivityTask must be called on a live worker");
-		RETURN_THROWS();
-	}
+	TEMPORAL_REQUIRE_LIVE_WORKER(self, "completeActivityTask");
 	TEMPORAL_ENSURE_COROUTINE();
 
 	temporal_outcome_t out;
@@ -1036,10 +1023,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, completeWorkflowActivation)
 
 	temporal_worker_obj *self = temporal_worker_from_obj(Z_OBJ_P(ZEND_THIS));
 
-	if (self->worker == NULL || self->finalized) {
-		zend_throw_error(NULL, "completeWorkflowActivation must be called on a live worker");
-		RETURN_THROWS();
-	}
+	TEMPORAL_REQUIRE_LIVE_WORKER(self, "completeWorkflowActivation");
 	TEMPORAL_ENSURE_COROUTINE();
 
 	temporal_outcome_t out;
@@ -1069,10 +1053,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, recordActivityHeartbeat)
 
 	/* No coroutine requirement: recording is synchronous in the core (in-memory
 	 * store; throttling and the server RPC run on the core's own threads). */
-	if (self->worker == NULL || self->finalized) {
-		zend_throw_error(NULL, "recordActivityHeartbeat must be called on a live worker");
-		RETURN_THROWS();
-	}
+	TEMPORAL_REQUIRE_LIVE_WORKER(self, "recordActivityHeartbeat");
 
 	char *fail = temporal_php_worker_record_heartbeat(((temporal_php_handle_t *) self->worker)->box,
 	                                          (const uint8_t *) ZSTR_VAL(heartbeat),
@@ -1102,10 +1083,7 @@ PHP_METHOD(TrueAsync_Temporal_Core_Worker, finalizeShutdown)
 
 	temporal_worker_obj *self = temporal_worker_from_obj(Z_OBJ_P(ZEND_THIS));
 
-	if (self->worker == NULL || self->finalized) {
-		zend_throw_error(NULL, "finalizeShutdown must be called on a live worker");
-		RETURN_THROWS();
-	}
+	TEMPORAL_REQUIRE_LIVE_WORKER(self, "finalizeShutdown");
 	TEMPORAL_ENSURE_COROUTINE();
 
 	/* No settle race here: our vendored core (true-async/sdk-rust) drops each
