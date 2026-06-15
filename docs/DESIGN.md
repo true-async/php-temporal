@@ -245,14 +245,21 @@ the bespoke dispatcher above: rather than write a new deterministic dispatcher,
 the worker reuses `temporalio/sdk-php`'s existing generator-based workflow engine
 (the Router/RunningWorkflows command-queue loop) unchanged, driven one activation
 at a time by `WorkflowWorkerFactory::processActivation`. Determinism is enforced
-by layer 3 — a runtime guard (`NonDeterministicWorkflowException`): a sentinel
-coroutine that, because the reactor is single-threaded, can only run if the
-worker coroutine actually suspended into the real reactor, which legit workflow
-code never does. Reusing the proven engine instead of reimplementing the state
-machines is what made the lifecycle (timers, activities, signals, queries,
-cancellation, child workflows, continue-as-new) land quickly and correctly;
-the blessed-primitive dispatcher remains a possible future direction, not the
-current design.
+by layer 3 — a runtime guard (`NonDeterministicWorkflowException`) modelled on the
+**Go SDK dispatcher's deadlock detector**: the activation is applied in a child
+coroutine and raced against a time budget (`DETERMINISM_BUDGET_MS`); correct
+workflow code resolves every wait synchronously from history and finishes far
+within the budget, so a workflow that blocks the worker coroutine on the real
+reactor (a direct `Async\*`, blocking I/O, a non-workflow await) overruns it and
+fails the task instead of committing a non-deterministic result. (An earlier
+version flagged the mere *fact* of a coroutine switch, which was wrong — a benign
+momentary switch, e.g. a fire-and-forget command like `upsertSearchAttributes`,
+is normal; only a *lasting* block is a violation, exactly as in Go.) Reusing the
+proven engine instead of reimplementing the state machines is what made the
+lifecycle (timers, activities, signals, queries, cancellation, child workflows,
+continue-as-new, external signal/cancel, updates, search attributes) land quickly
+and correctly; the blessed-primitive dispatcher remains a possible future
+direction, not the current design.
 
 ## 8. Build & dependencies
 
