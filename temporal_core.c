@@ -375,9 +375,13 @@ void *temporal_php_worker_new(void *connection, const char *ns, const char *task
 	opt.tuner.nexus_task_slot_supplier.tag = FixedSize;
 	opt.tuner.nexus_task_slot_supplier.fixed_size.num_slots = options->nexus_slots;
 
-	/* Handle both workflow and activity tasks (a Temporal worker does both). */
+	/* Handle workflow, activity and local-activity tasks (a Temporal worker does
+	 * all three). Local activities run in-process and surface on the same activity
+	 * poll (Start.is_local); without this flag the core never dispatches them and a
+	 * workflow that schedules one hangs until its task times out. */
 	opt.task_types.enable_workflows = true;
 	opt.task_types.enable_remote_activities = true;
+	opt.task_types.enable_local_activities = true;
 
 	/* Sticky execution: keep workflow runs cached between tasks so a fired timer
 	 * or resolved activity resumes the live instance instead of replaying from
